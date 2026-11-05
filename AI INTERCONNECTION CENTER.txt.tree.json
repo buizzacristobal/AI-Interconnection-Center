@@ -1,0 +1,308 @@
+{
+ "roots": [
+  {
+   "children": [
+    {
+     "title": "M1 chain timing",
+     "children": [],
+     "detail": "5 swings, timing ONLY in AnimData.R6.M1 (Duration 0.55-0.67, HitboxDelay = clip Hit marker 0.36-0.44); Play() must get the speed or it resets to 1. Hitstun 0.85 leaves >=0.15s spare per gap (verify_m1 asserts). No jump in stun. Hold LMB chains. Lunge: nearest fighter within 8 studs/30 deg, face it, stop 3 short (client PerAxis LV + brake; NPCs via findChainTarget). Hits: spark + white flash; finisher StepKnockback 30 (~7 studs, no stun), 0.12 hitstop. Remote swings whoosh. Aerial timing in AnimData.AerialStrike.",
+     "refs": [
+      "src/AnimData.luau",
+      "src/CombatServer.luau",
+      "src/CombatClient.luau",
+      "verify_m1.lua"
+     ]
+    },
+    {
+     "children": [],
+     "detail": "Server-side M1 resolution. Ping-compensated delay (clip.HitboxDelay minus half ping, clamped), GetPartBoundsInBox + multi-point LOS piercing loop that stops at collidable geometry only. Shared OverlapParams/RaycastParams (GC pressure). THE single hitbox path: 6 call sites, all in CombatServer.",
+     "refs": [
+      "src/Hitbox.luau",
+      "src/CombatServer.luau"
+     ],
+     "title": "Hitbox.QueryBox"
+    },
+    {
+     "children": [],
+     "detail": "Block cuts 65% and converts hits to posture; posture >= max = 1.8s guard-break stun. Parry: press within PerfectWindow 0.20s of the hit -> 0 damage, attacker stunned 1.0s + pushed back, dazed stars. ParryCooldown 0.6: a press opens a new window only 0.6s after the last closed (mashing just blocks); all parry paths share BlockStartClock. Client only shows blocks the server grants (not while stunned or mid-swing; restarts at stun end if F held). Server: mid-swing block waits for SwingEndsAt; block mid-dash cancels the dash.",
+     "refs": [
+      "CombatConfig.Block",
+      "src/CombatServer.luau",
+      "src/CombatClient.luau"
+     ],
+     "title": "Block and posture"
+    },
+    {
+     "children": [],
+     "detail": "Narrowed strictly to Transformation == SacrificedPotential. All other forms ragdoll normally and fire OnRecovered. Recovery: velocity zeroing, frame-anchor rebuild, Motor6D reset incl. Neck/RootJoint, floor spherecast poll (0.1s, 3s cap), no zombie loops on dead/unparented chars.",
+     "refs": [
+      "src/Ragdoll.luau"
+     ],
+     "title": "Ragdoll and recovery"
+    },
+    {
+     "children": [],
+     "detail": "Q then M2 within 0.35s. Dash locomotion is client-applied velocity; server gates cooldown/state only (displacement check proposed, not yet built). Ko on R, Ten tap / Ren hold on G (<0.25s vs >=0.25s), Ryu shift on LeftShift+wheel (0.15s debounce, no camera zoom).",
+     "refs": [
+      "src/CombatClient.luau"
+     ],
+     "title": "Evasion, dash, inputs"
+    }
+   ],
+   "detail": "Every swing resolves server-side. Client input is intent only; zero client hit claims.",
+   "title": "Combat core loop"
+  },
+  {
+   "children": [
+    {
+     "children": [],
+     "detail": "Ren/Ryu scale damage, Ten reduces incoming, Ko banks 2.5x damage / 2.2x posture then consumed, Shu 1.75x reach, Zetsu hides aura but doubles damage taken and is consumed by the hit (M1, aerial, JaJanken and strike chains alike). StealChain silence and ChainJail seal both strip+lock Ten/Ren/Ko/Shu/Gyo; ChainJail no longer forces Zetsu.",
+     "refs": [
+      "src/CombatServer.luau"
+     ],
+     "title": "Stance modifiers"
+    },
+    {
+     "children": [],
+     "detail": "Character attributes are the replicated source of truth; Humanoid follows. Single shared re-entrancy guard (settingHealthUnits) covers attribute + Humanoid paths; onDead idempotent via hasDied. NPC MaxHealth 500, MaxAura 700, 1.5s respawn.",
+     "refs": [
+      "src/CombatData.luau",
+      "src/CombatNPC.luau"
+     ],
+     "title": "Attributes and health sync"
+    }
+   ],
+   "detail": "Ten/Ren/Ko/Ryu/Shu/Gyo stances + Zetsu. TickNen heartbeat drives regen, drain, and Emperor lifespan burn.",
+   "title": "Nen system"
+  },
+  {
+   "children": [
+    {
+     "children": [],
+     "detail": "Stick counter 0-3 in UltName/PressG, stretch pitch 1.5/1.7/1.9, pink snap ring + double shockwave on 3rd stick and DynamicPull. Surge bar drains Fill over SurgeDuration in per-form colors.",
+     "refs": [
+      "src/CombatClient.luau",
+      "src/HUD.luau"
+     ],
+     "title": "Bungee Gum (Transmuter)"
+    },
+    {
+     "children": [],
+     "detail": "Rebuilt (JaJanken.luau + JaJankenVFX). One ~1.52s chant for all 3; the hand shows its form only on release; rooted, any hit cancels. Rock: nearest fighter in 8.5, a guard always shatters. Scissors: every fighter in the front arc (13), GuardPierce 0.5. Paper: server ball, 85 studs/s, range 90, bursts on the first fighter or wall, 8-stud blast (walls block, bodies don't). One Ko per release, kept on a whiff. Sacrificed one-shots. Procedural yellow-to-dark-orange Nen sphere VFX.",
+     "refs": [
+      "src/CombatConfig.luau Abilities"
+     ],
+     "title": "Gon JaJanken (Enhancer)"
+    },
+    {
+     "children": [],
+     "detail": "Moves={} outside Emperor Time. Five chains unlock only while Transformed == EmperorTime; hotbar equips slots 1-5 on activation, clears on expiry. Guarded tryCastSlot so Kurta never falls back to Bungee moves.",
+     "refs": [
+      "src/CombatConfig.luau Affinities.Kurta"
+     ],
+     "title": "Kurta (Specialist)"
+    },
+    {
+     "title": "Kanmuru (Transmuter)",
+     "detail": "Kanmuru.luau + LightningVFX. Electrical Charge 0-100 (attr ElectricCharge): ChargeCost (Palm 15, Thunderbolt 25), Godspeed 2/s, Whirlwind 4; +15 per M1 swing on a Power Box. Both clips at 1.5x. Palm: Q-dash-shaped assault (up to 12 studs, stops 3 short) planned by the server (PalmAssault), driven by the caster's own client, strike resolved from the planned end (0.25s). Thunderbolt: flight on the clip markers, strike 0.29s, lands ~0.97s. Clip times scale with Godspeed.",
+     "children": []
+    },
+    {
+     "title": "Neferpitou (Specialist)",
+     "detail": "Player moveset, keys 1/2/3 = PitouEn / PitouTerpsichora / PitouBlythe, all free toggles, numbers in CombatConfig.Pitou. En: tendrils to 2000 studs (whole map), radar through walls, hold E = aimed tendril, terror only on players with no Ten/Ren/Ko/Shu; look = HD-based Beam ribbons in PitouEnVFX, nothing solid (AGENTS 2e). Terpsichora: x1.6 speed, x1.9 dmg, maim, Space leap 900 studs, post-mortem rise via CombatData.LethalGuard. Blythe: shuts En+Terp, 56-stud leash, waits 30s for a patient. Client: AffinityVFX.Pitou (pcall facade PitouNenVFX). Test: verify_pitou_nen.lua.",
+     "refs": [
+      "src/PitouNen.luau",
+      "src/PitouBlythe.luau",
+      "src/PitouNenVFX.luau",
+      "src/CombatConfig.luau Pitou",
+      "AGENTS.md 2e"
+     ]
+    }
+   ],
+   "detail": "Players spawn with NO affinity (all nil until menu selection). Hotbar, ult bar, and inventory render from equipped moves only.",
+   "title": "Affinities and kits"
+  },
+  {
+   "children": [
+    {
+     "children": [],
+     "detail": "60s form, +66% all base stats (100->166 HP, 150->249 aura), 1.66x damage applied AFTER Ren/Ko/Ryu. Costs: 2 HP/s true lifespan burn (1-HP floor), 10 HP per ChainJail cast, 5s exhaustion on expiry (WalkSpeed 10, stances locked) + 15s transform cooldown. Duration read from Transformations.EmperorTime.SurgeDuration; revert guarded by TransformationGen.",
+     "refs": [
+      "src/CombatConfig.luau Transformations",
+      "src/CombatServer.luau"
+     ],
+     "title": "Emperor Time"
+    },
+    {
+     "children": [],
+     "detail": "Kanmuru Godspeed: 3x speed/dash/attack, 0.67x M1 damage, self-stun every 4 hits. Since the Kanmuru affinity update its lifecycle lives in Kanmuru.luau: needs 30 Electrical Charge, burns 2/s, ends when dry or at the 60s cap (TransformationGen guard; the old unguarded 60s timer could end a later transform). Whirlwind: every 3rd incoming hit auto-dodged. Abilities 20% faster inside it. BounceStriker and Sacrificed unchanged.",
+     "refs": [
+      "src/CombatServer.luau resolveHit"
+     ],
+     "title": "Kanmuru / BounceStriker / Sacrificed"
+    }
+   ],
+   "detail": "Surge bar drains over SurgeDuration with per-form colors and seconds readout. OnTransform has no cost by design; economy lives in burn + exhaustion.",
+   "title": "Transformations"
+  },
+  {
+   "children": [
+    {
+     "children": [],
+     "detail": "40 HP restore + stun/debuff cleanse, stun-breaker (bumps StunGen so old timers cannot resurrect). 35 aura, 18s CD, 0.30s windup, golden cross tip, chime.",
+     "refs": [
+      "src/CombatServer.luau",
+      "src/EmperorChainVFX.luau"
+     ],
+     "title": "HolyChain (Thumb)"
+    },
+    {
+     "children": [],
+     "detail": "Piercing thrust, 33 dmg, siphons 40 aura, 3.5s Nen silence (stances+casts only; Zetsu toggle still works as escape valve). Blocked: 65% cut + 20-33 posture, no steal/silence unless guard breaks. 0.20s prediction windup, needle-click SFX.",
+     "refs": [
+      "src/CombatServer.luau"
+     ],
+     "title": "StealChain (Index)"
+    },
+    {
+     "children": [],
+     "detail": "29 dmg, pulls victim, 2.2s bind + Nen sealed (stances stripped and locked; jailed victim cannot cast, HolyChain included). NO forced Zetsu since the Claude rework: its free 2x across the bind made Jail->Judgment a 145-dmg kill. Blocked (facing): 65% cut + posture, no pull/bind unless guard breaks. Costs 10 HP blood price per cast.",
+     "refs": [
+      "src/CombatServer.luau"
+     ],
+     "title": "ChainJail (Middle)"
+    },
+    {
+     "children": [],
+     "detail": "Melee parry, NOT an attack: 0.05 startup / 0.60 active / 0.25 rigid recovery. Parries M1s, aerial strikes and strike chains (not JaJanken). Perfect defense + ParryPostureDamage 35 (full guard break at >=100) + ParryStunDuration 0.75s stagger to attacker. Window always closes even if the Kurta falls mid-window. Old 15-stud vortex deleted as un-canon and overtuned.",
+     "refs": [
+      "src/CombatServer.luau checkDowsingParry"
+     ],
+     "title": "DowsingChain (Ring, Revolving Defense)"
+    },
+    {
+     "children": [],
+     "detail": "24 dmg (15 base x1.66) heart stake + 4s covenant: the covenant is the weapon (canon). Victim attacking/dashing/casting triggers JudgmentDamage 30 true, 1.8s stun, ragdoll. Trigger VFX per OpenCode ruling: Blood-Punch + one 9-stud ring + beat of silence + low thump (no explosion/crater). Covenant persists through Emperor expiry. 0.40s reactable windup, execution gong.",
+     "refs": [
+      "src/CombatServer.luau"
+     ],
+     "title": "JudgmentChain (Pinky)"
+    },
+    {
+     "children": [],
+     "detail": "Chains fly on the server's ChainLaunch event with travel time = server flight, so the tip lands when the strike resolves; hit/miss events only play the outcome (siphon/crack/blood only when unblocked; markers use payload.Duration, 0 = none). fireChainBeam: ribbon of white/silver links behind a lead tip, holds, fades 1.2s. CHAIN_LOOK holds per-chain tip/glow (syringe/hook/dagger; cross and sphere for Holy/Dowsing). Jail coils wind 1-2-3-4 at 0.15s. 0.10/0.14 hitstop. MegaPack templates with Workspace fallback.",
+     "refs": [
+      "src/EmperorChainVFX.luau",
+      "ReplicatedStorage.NenCombat.VFX.MegaPackTemplates"
+     ],
+     "title": "Chain VFX language"
+    },
+    {
+     "children": [],
+     "detail": "Top-center chips at y84 in per-chain hues (scarlet/violet/gunmetal) with live countdown + hotbar lock overlays while silenced/bound. Attacker toast on covenant confirm. Steel = weapons, flame = Emperor state (lifespan burn made visible).",
+     "refs": [
+      "src/HUD.luau"
+     ],
+     "title": "Victim-side feedback (HUD)"
+    }
+   ],
+   "detail": "Canon Kurapika kit. Steal/Jail/Judgment share ONE server pipeline (castChainStrike), same rule order as M1: ghost dodge -> Revolving Defense -> facing block / perfect block (staggers the Kurta) -> Ryu/Ren/Ten/Zetsu/Ko, Zetsu doubled and consumed. Windup -> ChainLaunch flight (clients draw the chain) -> resolve -> 0.12s endlag; the cast lock spans all of it, one chain at a time. Worst cases without Ren: Jail->Judgment 53, Jail->Judgment->Steal 86.",
+   "title": "Emperor chains (5 abilities)"
+  },
+  {
+   "children": [
+    {
+     "children": [],
+     "detail": "Owned HotbarRow container (bottom-anchored, own UIListLayout), 82px slots, white procedural glyphs (19 icons, zero external assets), surge bar + PressG stacked by viewport math with on-screen clamp, combo counter at (40,190), viewport-relative InfoFrame menu.",
+     "refs": [
+      "src/HUD.luau",
+      "src/Icons.luau"
+     ],
+     "title": "Hotbar and layout normalizer"
+    },
+    {
+     "children": [],
+     "detail": "NenMasterNPC + CombatNPC AI (speed only set while Idle, from CombatServer.GetBaseSpeed, so slows apply). NPC commands: 2s per-player rate limit, SpawnNear caps at 6 (Claude sweep). ActivatePower routes through OnCastAbility. Clones start from wiped attributes. Still open: dash is client-applied velocity with no server displacement check.",
+     "refs": [
+      "src/CombatNPC.luau",
+      "src/CombatMain.luau"
+     ],
+     "title": "NPCs, clones, open security items"
+    }
+   ],
+   "detail": "Client presentation and AI opponents.",
+   "title": "HUD, NPCs, clones"
+  },
+  {
+   "children": [
+    {
+     "children": [],
+     "detail": "22 remotes mapped; 21 safe by construction (validated IDs, server hitboxes). CombatMain singleton guard via _G aborts duplicate executors. Exactly ONE ServerScriptService.CombatServer folder must exist - historical 4x duplication caused 4x damage/aura/burn and cross-copy Attacking spam.",
+     "refs": [
+      "src/CombatMain.luau"
+     ],
+     "title": "Remotes and singleton"
+    },
+    {
+     "children": [],
+     "detail": "src/ is the only source of truth. Sync via HTTP :19842 + sync_to_studio.lua, loadstring preflight every file, Edit-mode playtests returning to Edit. Suites: verify_combat_sweep 10/10, verify_kurta_mechanics 16/16, verify_all 10/10, verify_tasks_123 23/23. verify_kurta.lua / verify_kurta_extended.lua are stale (they wait 0.35s; strikes resolve after ChainLaunch flight).",
+     "refs": [
+      "sync_to_studio.lua",
+      "check_syntax.py",
+      "AGENTS.md"
+     ],
+     "title": "Sync and verify pipeline"
+    },
+    {
+     "children": [],
+     "detail": "Hard ceiling <180KB per script, 200KB Studio wall. Split, don't grow: CombatServer 176.1KB, CombatClient 172.5KB (also at Luau's 200-local limit: new client code goes in AffinityVFX modules), HUD 87.7KB. Ability logic lives in ServerScriptService.CombatServer modules (AbilityStrike, JaJanken, Kanmuru, PitouNen, PitouBlythe), VFX in ReplicatedStorage.NenCombat modules (EmperorChainVFX, JaJankenVFX, LightningVFX).",
+     "refs": [
+      "src/EmperorChainVFX.luau"
+     ],
+     "title": "Script size budgets"
+    },
+    {
+     "title": "Ability modules (AbilityStrike)",
+     "detail": "CombatServer.ABILITY_MODULES maps ability ids to modules (Cast required, CanCast optional resource check before aura and cooldown are spent). One shared context (fighters, stun, knockback, evade = ghost dodge or Whirlwind, kill...) is given to every module. AbilityStrike.Roll rolls the attacker Nen stack once per release; Resolve applies: evade, Revolving Defense, perfect block, Ryu/Ten/Ko/Zetsu, guard crush/pierce/break, damage, then the module's OnLand.",
+     "children": []
+    }
+   ],
+   "detail": "Server authority, validated payloads, no circular requires, clean client/server boundary.",
+   "title": "Netcode and architecture"
+  },
+  {
+   "title": "Known issues and open threads",
+   "detail": "Things nobody should re-discover the hard way.",
+   "refs": [],
+   "children": [
+    {
+     "children": [],
+     "detail": "Five animation assets fail experience-access checks, so affected casts play motionless. Fix is Game Settings asset sharing under the place owner (USER-owned, no code fix exists).",
+     "refs": [
+      "channel: animation permissions thread"
+     ],
+     "title": "Animation asset permissions (USER action)"
+    },
+    {
+     "children": [],
+     "detail": "Burn-vs-Holy economy, Jail/Judgment flowcharts, and Dowsing parry feel can only be settled with single-execution play numbers. Earlier 4x-era math is void.",
+     "refs": [
+      "channel: advisory rounds 3-6"
+     ],
+     "title": "Balance tuning needs play data"
+    },
+    {
+     "children": [],
+     "detail": "Covenant victim ghost-dodging still eats +30 (dash check fires before dodge resolution). ChainJailBound rejects all casts including HolyChain cleanse. Both are judgment calls, deliberately undecided.",
+     "refs": [
+      "channel: advisory round 1"
+     ],
+     "title": "Open design questions"
+    }
+   ]
+  }
+ ],
+ "version": 11,
+ "updated_by": "Claude",
+ "updated_at": "2026-10-30T19:57:11Z"
+}

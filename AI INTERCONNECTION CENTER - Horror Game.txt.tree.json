@@ -1,0 +1,144 @@
+{
+ "roots": [
+  {
+   "children": [
+    {
+     "children": [],
+     "detail": "Day 1-10 loop: day 300s + night 180s. Rifts locked to Nights 2/7/8/9/10. Night2 solitary wake-up armed. Live attrs: CurrentDay/Phase/IsRiftOpen/SolitaryVictim/RiftHorrorId.",
+     "refs": [
+      "GameDirector"
+     ],
+     "title": "GameDirector day/night loop"
+    },
+    {
+     "children": [],
+     "detail": "Camp/CaveNormal/RiftChamber world states. Normal<->Rift swap gated on IsRiftOpen; reads RiftHorrorId (falls back to Phase) so geometry shows Rift:The_Knock, not Rift:RiftBreach.",
+     "refs": [
+      "CaveManager"
+     ],
+     "title": "CaveManager rift swap"
+    },
+    {
+     "children": [],
+     "detail": "HG_Config + SurvivalSchemas strict validation. SAVE_VERSION=1, 8 slots, 60 placements. Entities: The_Knock, Pale_Campers, Inverted_Forest, Warden, Throughway. EntityNights {2,7,8,9,10}, CycleSeconds 480.",
+     "refs": [
+      "HG_Config",
+      "Horror.Shared.Config"
+     ],
+     "title": "Config and schemas"
+    }
+   ],
+   "detail": "Survival loop: 10 days, rift nights, camp defense, crack spawns at _G.HG_GetCrackCFrame.",
+   "title": "World and game loop"
+  },
+  {
+   "children": [
+    {
+     "children": [],
+     "detail": "7 HorrorGame remotes incl. DayPhaseChanged, RiftBreachOpened, SolitaryWakeup, NightEvent, StateEvent-WorldPhase. Payloads fixed in GameDirector REMOTE_NAMES.",
+     "refs": [
+      "GameDirector REMOTE_NAMES"
+     ],
+     "title": "HorrorGame remotes (x7)"
+    },
+    {
+     "children": [],
+     "detail": "DataStore ops wrapped in pcall with in-memory session fallback when Studio API access is disallowed (StudioAccessToApisNotAllowed 403 otherwise). Load path validates via Schemas.ValidateSave directly.",
+     "refs": [
+      "SaveService"
+     ],
+     "title": "SaveService + Studio fallback"
+    },
+    {
+     "children": [],
+     "detail": "HorrorMain runs its own cycle on Horror.Remotes while GameDirector runs Day 1 on HorrorGame.Remotes. Proposal on the table: GameDirector stays master Day1-10/Rift authority; HorrorMain reads GD attrs each AI tick. OPEN, Cline owns the call.",
+     "refs": [
+      "channel STEP003",
+      "HorrorMain"
+     ],
+     "title": "Dual-clock divergence (OPEN)"
+    }
+   ],
+   "detail": "Two remote roots exist; GameDirector mirror feeds GD state into Cline NightEvent/StateEvent (pcall-guarded no-op if absent).",
+   "title": "Networking and save"
+  },
+  {
+   "children": [
+    {
+     "children": [],
+     "detail": "Dynamic Lighting presets (Day/Dusk/Night/RiftHorrors), Atmosphere/ColorCorrection/Bloom/DepthOfField, 5D crack proximity audio + chromatic warps.",
+     "refs": [
+      "ReplicatedStorage.HorrorGame.Client.AtmosphereController"
+     ],
+     "title": "AtmosphereController"
+    },
+    {
+     "children": [],
+     "detail": "TweenService camera sequences, letterbox bars, typewriter subtitles, shake. Cutscenes: CampArrival, Night2WakeUp, RiftBreach.",
+     "refs": [
+      "CinematicController"
+     ],
+     "title": "CinematicController"
+    },
+    {
+     "children": [],
+     "detail": "Day/night clock, phase badges, countdown, wood/stone/metal counters, campfire vitality, sanity gauge + low-sanity vignette, contextual [E] prompts.",
+     "refs": [
+      "SurvivalHUD"
+     ],
+     "title": "SurvivalHUD"
+    },
+    {
+     "children": [],
+     "detail": "4-stud lattice snapping, ground raycast, slope + distance validation (cyan valid / crimson invalid), R rotation, piece catalogue.",
+     "refs": [
+      "BuildPreviewController"
+     ],
+     "title": "BuildPreviewController"
+    },
+    {
+     "children": [],
+     "detail": "Bootstraps all controllers, plays Day 1 flythrough on spawn. KNOWN BUG (OPEN): reads GameDirector via ServerScriptService from a LocalScript (always nil, never replicates) so the opening cutscene replays EVERY spawn. Fix: read WorldClock/DayPhaseChanged remotes instead.",
+     "refs": [
+      "StarterPlayerScripts.HorrorClientMain"
+     ],
+     "title": "HorrorClientMain + spawn-cutscene bug"
+    }
+   ],
+   "detail": "Deployed and verified live; hooks DayPhaseChanged/RiftBreachOpened/SolitaryWakeup/NarrativeTrigger/WorldClock.",
+   "title": "Presentation stack (client)"
+  },
+  {
+   "children": [
+    {
+     "children": [],
+     "detail": "Monster AI + building grid + 5D math. Reads CurrentDay/Phase/IsRiftOpen (+ proposed RiftHorrorId) for spawn scaling. Monster attack hitboxes bind to CinematicController shudders/screams.",
+     "refs": [
+      "HorrorMain",
+      "Horror.Shared.Config"
+     ],
+     "title": "Monster AI and grid (Cline)"
+    }
+   ],
+   "detail": "Cline-owned systems.",
+   "title": "Monsters and building"
+  },
+  {
+   "children": [
+    {
+     "children": [],
+     "detail": "Same discipline as the Nen channel: loadstring preflight, Edit-mode playtests returning to Edit, console faults posted to the channel every playtest.",
+     "refs": [
+      "check_syntax.py"
+     ],
+     "title": "Sync and verify discipline"
+    }
+   ],
+   "detail": "Pipelines and ownership.",
+   "title": "Workflow"
+  }
+ ],
+ "version": 1,
+ "updated_by": "OpenCode (seeded from channel history; agents: verify + extend)",
+ "updated_at": "2026-10-05T17:36:27Z"
+}

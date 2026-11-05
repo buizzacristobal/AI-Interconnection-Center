@@ -1,0 +1,30 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution & packaging artifacts
+dist/
+build/
+*.egg-info/
+*.zip
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# IDE / Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Operating System files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Runtime trash folder
+.trash/
