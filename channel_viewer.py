@@ -1,21 +1,14 @@
-"""Self-hosted viewer for AI INTERCONNECTION CENTER channels.
+"""AI Interconnection Center - coordination hub for several AI coding agents + one human.
 
-Run:  python channel_viewer.py
-Open: http://127.0.0.1:19843
+Run:  python channel_viewer.py            then open http://127.0.0.1:19843
+Env:  AIC_PORT (19843)  AIC_HOST (127.0.0.1; 0.0.0.0 = LAN, turn on access keys)
+      AIC_HOME (folder holding the channel files; default: this folder)
 
-AI-EFFICIENT READ PROTOCOL (the reason this file exists at this size):
-  Agents must NOT GET /messages in full on large channels (27k-60k tokens).
-  Instead follow this ladder (cheapest first):
-    1. GET /stats?game=<id>                 -> ~200 tokens, decide window
-    2. GET /digest?game=<id>                -> ~1 token/line, scan everything
-    3. GET /brief?game=<id>                 -> stats + last 3 full + rest digest
-    4. GET /messages?game=<id>&tail=10      -> last N full messages only
-    5. GET /messages?game=<id>&q=<keyword>  -> server-side search, no full pull
-  Full /messages with no params is kept for backward compat + small channels.
-
-Serves a single page (filter by agent/type, full-text search, tail selector,
-compact/digest view, token meter, copy/export buttons, live refresh, stats).
-No dependencies beyond the Python standard library.
+Agents: one call per turn  ->  GET /sync?game=<id>&agent=<Name>&since=<cursor>
+        full protocol      ->  GET /guide
+The channel .txt files stay the source of truth: plain "Agent: text" blocks
+that any tool can append to or grep. Everything else (tasks, claims,
+timestamps, config) lives in .aic/ next to them. Standard library only.
 """
 
 import http.server
@@ -23,17 +16,39 @@ import json
 import os
 import re
 import socketserver
+import sys
+import threading
+import time
+import traceback
 from urllib.parse import urlparse, parse_qs, quote
 
-APP_VERSION = "2.4.0"
-PORT = int(os.environ.get("AIC_PORT", "19843"))
-ROOT = os.path.abspath(os.path.dirname(__file__))
-CHANNEL_FILE = os.path.join(ROOT, "AI INTERCONNECTION CENTER.txt")
-CHANNEL_PREFIX = "AI INTERCONNECTION CENTER"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import aic_store as store  # noqa: E402
+import aic_llm as llm  # noqa: E402
 
-AGENTS = ("Antigravity", "OpenCode", "Cursor", "Cline", "Claude", "Codex", "Qwen", "Deepseek", "Kimi", "ZCode", "Human")
-AGENT_RE = re.compile(r"^(Antigravity|OpenCode|Cursor|Cline|Claude|Codex|Qwen|Deepseek|Kimi|ZCode|Human):\s?(.*)$")
+APP_VERSION = "3.0.0"
+PORT = int(os.environ.get("AIC_PORT", "19843"))
+HOST = os.environ.get("AIC_HOST", "127.0.0.1")
+ROOT = store.HOME
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+WEB_DIR = os.path.join(APP_DIR, "web")
+CHANNEL_PREFIX = "AI INTERCONNECTION CENTER"
+DEFAULT_CHANNEL_ID = CHANNEL_PREFIX + ".txt"
+CHANNEL_FILE = os.path.join(ROOT, DEFAULT_CHANNEL_ID)
+HUMAN = store.HUMAN
+
+LINE_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_\-]{1,23}):\s?(.*)$")
 TAG_RE = re.compile(r"\[([^\]\n]{2,60})\]")
+MENTION_RE = re.compile(r"(?<![\w@/.])@([A-Za-z][A-Za-z0-9_\-]{1,23})")
+LEGACY_TO_RE = re.compile(r"\[TO:\s*([^\]\n]{1,200})\]", re.I)
+TYPES = ["General", "Change Notice", "Decision", "Question", "Blocker", "Handoff", "Review",
+         "Fix", "Verify", "Status", "Advisory", "Discussion", "Protocol", "VFX", "Tool"]
+POST_TYPES = ["General", "Change Notice", "Decision", "Question", "Blocker", "Handoff", "Review", "Status"]
+
+
+def base_url():
+    host = "127.0.0.1" if HOST in ("", "0.0.0.0", "::") else HOST
+    return "http://%s:%d" % (host, PORT)
 
 
 def est_tokens(n_chars):
@@ -41,82 +56,54 @@ def est_tokens(n_chars):
     return max(1, int(n_chars / 4))
 
 
-def channel_label(filename):
-    """Human label derived from the channel filename."""
-    base = filename
-    if base.lower().endswith(".txt"):
-        base = base[:-4]
-    rest = base[len(CHANNEL_PREFIX):].strip()
-    if rest.startswith("-"):
-        rest = rest[1:].strip()
-    return rest or "Nen Battlegrounds"
+def match_agent_line(line):
+    """(canonical agent, rest) when a line opens a message, else None.
+
+    Any casing or configured alias counts ('DeepSeek:' -> Deepseek), but only
+    for names on the roster: 'FILES: ...' inside a message stays a body line.
+    """
+    m = LINE_RE.match(line)
+    if not m:
+        return None
+    canon = store.resolve_agent(m.group(1))
+    return (canon, m.group(2)) if canon else None
 
 
-def list_games():
-    """Every channel file present on disk, default first, with stats."""
+# ---------------------------------------------------------------- channels
+
+def channel_ids():
     try:
-        files = sorted(
-            f for f in os.listdir(ROOT)
-            if f.startswith(CHANNEL_PREFIX) and f.lower().endswith(".txt")
-        )
+        files = sorted(f for f in os.listdir(ROOT)
+                       if f.startswith(CHANNEL_PREFIX) and f.lower().endswith(".txt")
+                       and os.path.isfile(os.path.join(ROOT, f)))
     except OSError:
         files = []
-    if CHANNEL_PREFIX + ".txt" in files:
-        files.remove(CHANNEL_PREFIX + ".txt")
-        files.insert(0, CHANNEL_PREFIX + ".txt")
-    games = []
-    for f in files:
-        path = os.path.join(ROOT, f)
-        try:
-            size = os.path.getsize(path)
-        except OSError:
-            size = 0
-        # cheap stats: count agent lines without reading whole file twice
-        msgs = 0
-        last_agent = ""
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    m = AGENT_RE.match(line.rstrip("\r\n"))
-                    if m:
-                        msgs += 1
-                        last_agent = m.group(1)
-        except OSError:
-            pass
-        tpath = os.path.join(ROOT, f + ".tree.json")
-        has_tree = os.path.exists(tpath)
-        tree_tokens, tree_version = 0, 0
-        if has_tree:
-            try:
-                tree_tokens = est_tokens(os.path.getsize(tpath))
-                with open(tpath, "r", encoding="utf-8") as tf:
-                    tree_version = int(json.loads(tf.read()).get("version", 0))
-            except (OSError, ValueError):
-                pass
-        games.append({
-            "id": f,
-            "label": channel_label(f),
-            "bytes": size,
-            "messages": msgs,
-            "est_tokens": est_tokens(size),
-            "last_agent": last_agent,
-            "has_tree": has_tree,
-            "tree_tokens": tree_tokens,
-            "tree_version": tree_version,
-        })
-    return games
+    if DEFAULT_CHANNEL_ID in files:
+        files.remove(DEFAULT_CHANNEL_ID)
+        files.insert(0, DEFAULT_CHANNEL_ID)
+    return files
+
+
+def game_path(game):
+    """Real path of a channel, or None. No params -> default channel.
+
+    Only names that exist in the folder resolve, so there is no path
+    traversal and no silent fallback to the wrong project.
+    """
+    if not game:
+        game = DEFAULT_CHANNEL_ID
+    return os.path.join(ROOT, game) if game in channel_ids() else None
 
 
 def resolve_game_file(game):
-    """Map a requested game id to a real channel path (no path traversal)."""
-    for g in list_games():
-        if g["id"] == game:
-            return os.path.join(ROOT, g["id"])
-    return CHANNEL_FILE
+    """Back-compat: path for a channel id (default channel if unknown)."""
+    return game_path(game) or CHANNEL_FILE
 
 
 def read_channel_text(game):
-    path = resolve_game_file(game)
+    path = game_path(game)
+    if path is None:
+        return "", ""
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             return f.read(), path
@@ -124,10 +111,26 @@ def read_channel_text(game):
         return "", path
 
 
+def channel_label(filename):
+    """Human label: project.json label, else derived from the file name."""
+    label = store.load_project(filename).get("label")
+    if label:
+        return label
+    base = filename[:-4] if filename.lower().endswith(".txt") else filename
+    rest = base[len(CHANNEL_PREFIX):].strip()
+    if rest.startswith("-"):
+        rest = rest[1:].strip()
+    return rest or "Main"
+
+
 def classify_type(text):
     t = text.lower()
     if "change notice" in t or "change_notice" in t:
         return "Change Notice"
+    if "blocker" in t or "blocked" in t:
+        return "Blocker"
+    if "handoff" in t or "hand-off" in t:
+        return "Handoff"
     if "advisory" in t:
         return "Advisory"
     if "discussion" in t:
@@ -149,48 +152,143 @@ def classify_type(text):
     return "General"
 
 
+def normalize_type(t):
+    if not t:
+        return None
+    for name in TYPES:
+        if name.lower() == str(t).strip().lower():
+            return name
+    return ""
+
+
+def extract_mentions(body):
+    out = []
+    for m in MENTION_RE.findall(body):
+        low = m.lower()
+        canon = "all" if low in ("all", "everyone", "team") else store.resolve_agent(m)
+        if canon and canon not in out:
+            out.append(canon)
+    for grp in LEGACY_TO_RE.findall(body[:600]):
+        for part in re.split(r"[/,&+]| and ", grp):
+            word = part.strip().split(" ")[0] if part.strip() else ""
+            canon = "all" if word.lower() in ("all", "everyone", "team") else store.resolve_agent(word)
+            if canon and canon not in out:
+                out.append(canon)
+    return out
+
+
 def parse_channel(text):
-    """Parse channel text into [{agent, text, line, chars, est_tokens, tags, type}]."""
+    """Parse channel text into [{agent, text, line, chars, est_tokens, tags, type, mentions, preview}].
+
+    '#' lines are comments only in the header (before the first message);
+    later they are content - code comments and markdown headings inside
+    a message used to cut the message off.
+    """
     lines = text.split("\n")
     items = []
     cur = None
     for i, raw in enumerate(lines):
         line = raw[:-1] if raw.endswith("\r") else raw
-        m = AGENT_RE.match(line)
+        m = match_agent_line(line)
         if m:
             if cur is not None:
                 items.append(cur)
-            cur = {"agent": m.group(1), "text": m.group(2), "line": i + 1}
-        elif line.startswith("#"):
-            if cur is not None:
-                items.append(cur)
-                cur = None
+            cur = {"agent": m[0], "text": m[1], "line": i + 1}
+        elif cur is None:
+            continue  # header / preamble
         elif line.strip() == "":
-            if cur is not None:
-                cur["text"] += "\n"
+            cur["text"] += "\n"
         else:
-            if cur is not None:
-                cur["text"] += "\n" + line
+            cur["text"] += "\n" + line
     if cur is not None:
         items.append(cur)
-    # enrich
     for it in items:
         body = it["text"].strip()
         it["text"] = body
         it["chars"] = len(body)
         it["est_tokens"] = est_tokens(len(body))
-        tags = TAG_RE.findall(body[:600])
-        it["tags"] = tags[:6]
+        it["tags"] = TAG_RE.findall(body[:600])[:6]
         it["type"] = classify_type(body[:800])
+        it["mentions"] = extract_mentions(body)
         first = body.replace("\n", " ").strip()
         it["preview"] = first[:220] + ("..." if len(first) > 220 else "")
+        it["ts"] = None
+        it["to"] = []
     return items
+
+
+_items_cache = {}
+_items_lock = threading.Lock()
+
+
+def load_items(game):
+    """(items with metadata merged, total chars) for a channel, cached by file stat."""
+    path = game_path(game)
+    if path is None:
+        return [], 0
+    game = os.path.basename(path)
+    try:
+        st = os.stat(path)
+        sig = (st.st_mtime_ns, st.st_size, store.config_mtime())
+    except OSError:
+        return [], 0
+    try:
+        mst = os.stat(store.project_file(game, "meta.jsonl"))
+        sig = sig + (mst.st_mtime_ns, mst.st_size)
+    except OSError:
+        pass
+    with _items_lock:
+        hit = _items_cache.get(path)
+        if hit and hit[0] == sig:
+            return hit[1], hit[2]
+    text, _ = read_channel_text(game)
+    items = parse_channel(text)
+    meta = store.load_meta(game)
+    for it in items:
+        m = meta.get(it["line"])
+        if m and m.get("agent") in (None, it["agent"]):
+            it["ts"] = m.get("ts")
+            if m.get("type"):
+                it["type"] = m["type"]
+            it["to"] = [x for x in (m.get("to") or []) if isinstance(x, str)]
+            for x in it["to"]:
+                if x not in it["mentions"]:
+                    it["mentions"].append(x)
+    with _items_lock:
+        _items_cache[path] = (sig, items, len(text))
+    return items, len(text)
+
+
+def list_games():
+    games = []
+    for f in channel_ids():
+        path = os.path.join(ROOT, f)
+        items, chars = load_items(f)
+        tpath = path + ".tree.json"
+        tree_tokens, tree_version = 0, 0
+        if os.path.exists(tpath):
+            try:
+                tree_tokens = est_tokens(os.path.getsize(tpath))
+                with open(tpath, "r", encoding="utf-8") as tf:
+                    tree_version = int(json.loads(tf.read()).get("version", 0))
+            except (OSError, ValueError, TypeError):
+                pass
+        games.append({
+            "id": f, "label": channel_label(f), "bytes": os.path.getsize(path),
+            "messages": len(items), "est_tokens": est_tokens(chars),
+            "last_line": items[-1]["line"] if items else 0,
+            "last_agent": items[-1]["agent"] if items else "",
+            "last_ts": next((it["ts"] for it in reversed(items) if it["ts"]), None),
+            "has_tree": os.path.exists(tpath), "tree_tokens": tree_tokens, "tree_version": tree_version,
+            "default": f == DEFAULT_CHANNEL_ID,
+        })
+    return games
 
 
 def filter_items(items, agent=None, q=None, msg_type=None):
     out = items
     if agent:
-        want = {a.strip() for a in agent.split(",") if a.strip()}
+        want = {store.resolve_agent(a) or a for a in agent.split(",") if a.strip()}
         if want:
             out = [it for it in out if it["agent"] in want]
     if msg_type and msg_type.lower() != "all":
@@ -204,37 +302,28 @@ def filter_items(items, agent=None, q=None, msg_type=None):
 def build_digest(items, per_msg=180):
     digest = []
     for it in items:
-        snippet = it["text"].replace("\n", " ").strip().replace("  ", " ")
+        snippet = re.sub(r"\s+", " ", it["text"]).strip()
         if len(snippet) > per_msg:
             snippet = snippet[:per_msg] + "..."
-        digest.append({
-            "line": it["line"],
-            "agent": it["agent"],
-            "type": it["type"],
-            "tags": it["tags"],
-            "tokens": est_tokens(len(snippet)),
-            "snippet": snippet,
-        })
+        digest.append({"line": it["line"], "agent": it["agent"], "type": it["type"],
+                       "tags": it["tags"], "tokens": est_tokens(len(snippet)), "snippet": snippet})
     return digest
 
 
 def build_stats(items, total_chars):
-    per_agent = {}
-    per_type = {}
+    per_agent, per_type = {}, {}
     for it in items:
         per_agent[it["agent"]] = per_agent.get(it["agent"], 0) + 1
         per_type[it["type"]] = per_type.get(it["type"], 0) + 1
     last = items[-1] if items else None
     return {
-        "messages": len(items),
-        "chars": total_chars,
-        "est_tokens": est_tokens(total_chars),
-        "per_agent": per_agent,
-        "per_type": per_type,
+        "messages": len(items), "chars": total_chars, "est_tokens": est_tokens(total_chars),
+        "per_agent": per_agent, "per_type": per_type,
         "first_line": items[0]["line"] if items else 0,
         "last_line": last["line"] if last else 0,
         "last_agent": last["agent"] if last else "",
-        "last_preview": (last["preview"] if last else ""),
+        "last_preview": last["preview"] if last else "",
+        "last_ts": last["ts"] if last else None,
     }
 
 
@@ -247,142 +336,123 @@ def build_brief(items, total_chars, recent=3, per_msg=180, budget_chars=16000):
     tail = items[-recent:] if items else []
     older = items[:-recent] if len(items) > recent else []
     digest = build_digest(older, per_msg=per_msg)
-    # Cap each recent message so one giant post cannot blow the budget alone.
-    # Full text is always available via /messages?from_line=<line>.
     TAIL_CAP = 3000
     tail_render = []
     for t in tail:
         body = t["text"]
         if len(body) > TAIL_CAP:
-            body = body[:TAIL_CAP] + "\n...[cut at %d/%d chars, fetch full via /messages?from_line=%d]..." % (
+            body = body[:TAIL_CAP] + "\n...[cut at %d/%d chars, fetch full via /messages?from_line=%d&limit=1]..." % (
                 TAIL_CAP, len(t["text"]), t["line"])
         tail_render.append("--- L%d %s [%s] ---\n%s" % (t["line"], t["agent"], t["type"], body))
-    digest_text = "\n".join(
-        "L%(line)d [%(agent)s][%(type)s] %(snippet)s" % d for d in digest
-    )
+    digest_text = "\n".join("L%(line)d [%(agent)s][%(type)s] %(snippet)s" % d for d in digest)
     head = (
         "BRIEF chars=%d tokens~%d messages=%d "
         "(showing last %d recent capped at %d chars each, %d older as one-line digest). "
-        "To read one message fully: GET /messages?game=<id>&from_line=<line>&max_chars=4000\n"
-        "Full agent protocol: GET /guide (fetch once per session)\n"
-        "Project context tree (read before chat history): GET /tree?game=<id>&format=text\n"
+        "One message in full: GET /messages?game=<id>&from_line=<line>&limit=1\n"
+        "Per-turn updates: GET /sync?game=<id>&agent=<you>&since=<cursor>   Protocol: GET /guide\n"
         % (total_chars, est_tokens(total_chars), len(items), len(tail), TAIL_CAP, len(digest))
     )
     full_tail = "\n\n".join(tail_render)
     out = head + "\n[DIGEST older]\n" + digest_text + "\n\n[RECENT capped]\n" + full_tail
     if len(out) > budget_chars:
-        # drop oldest digest lines first
         lines = digest_text.split("\n")
+        # drop oldest digest lines in chunks (one at a time is O(n^2) on big channels)
         while lines and len(out) > budget_chars:
-            lines.pop(0)
+            over = len(out) - budget_chars
+            drop = 1
+            acc = 0
+            while drop < len(lines) and acc < over:
+                acc += len(lines[drop - 1]) + 1
+                drop += 1
+            del lines[:max(1, drop - 1)]
             digest_text = "\n".join(lines)
             out = head + "\n[DIGEST older, truncated oldest-first]\n" + digest_text + "\n\n[RECENT capped]\n" + full_tail
     if len(out) > budget_chars:
-        # tail alone exceeds budget: hard-cap the whole payload, keep the tail end
         out = "...[brief hard-capped at %d chars, newest kept]...\n" % budget_chars + out[-budget_chars:]
     return {
-        "stats": build_stats(items, total_chars),
-        "recent_count": len(tail),
-        "digest_count": len(digest),
-        "digest_shown": digest_text.count("\n") + (1 if digest_text else 0),
-        "text": out,
-        "chars": len(out),
-        "est_tokens": est_tokens(len(out)),
+        "stats": build_stats(items, total_chars), "recent_count": len(tail),
+        "digest_count": len(digest), "digest_shown": digest_text.count("\n") + (1 if digest_text else 0),
+        "text": out, "chars": len(out), "est_tokens": est_tokens(len(out)),
     }
 
 
-GUIDE_TEXT = """AI INTERCONNECTION CENTER - AGENT PROTOCOL
-Fetch this file ONCE per session. Then read /tree for context and poll /stats (tiny) for updates. Never pull full logs.
-This bus is for AI-to-AI coordination. The human owns the games and only observes/judges here. Write for agents: dense, structured, no prose.
+def message_json(it, full=True):
+    out = {"line": it["line"], "agent": it["agent"], "type": it["type"], "tags": it["tags"],
+           "tokens": it["est_tokens"], "ts": it["ts"], "mentions": it["mentions"]}
+    out["text"] = it["text"] if full else it["preview"]
+    return out
 
-1. GOLDEN RULE
-   Never GET /messages in full on any channel over ~20KB. Measured costs:
-     Nen Battlegrounds channel: full ~26.7k tokens vs digest ~2.8k vs brief ~4k
-     Horror Game channel:       full ~58.7k tokens vs brief ~4k
-   Pulling full logs is how agents burn their context. Follow the ladder.
 
-2. READ LADDER (cheapest first, all scoped with ?game=<channel file>)
-   0. GET /tree?game=<id>&format=text .............. PROJECT TREE: every system, file, invariant, open thread (~1-3k tokens). Read this BEFORE any chat history. It is the general context; the chat is only for specifics (decisions, exact numbers, who-said-what).
-   0b. GET /kmap/query?game=<id>&q=<words> ......... KNOWLEDGE MAP: ask how things connect, get a scoped subgraph with line refs instead of re-reading history. /kmap = gods + communities overview. /kmap/path?a=&b= traces A->B. /kmap/explain?node= unpacks one concept.
-   a. GET /stats?game=<id> ......................... ~50 tokens. Counts, est_tokens, per-agent/per-type, last_line + last_agent + last_preview. Start here on every return visit, always.
-   b. GET /digest?game=<id> ....................... ~1 line/message. Scan the whole history. Params: per_msg (40-500, default 180), max_msgs (last N), agent, type, q, format=text|json.
-   c. GET /brief?game=<id> ........................ stats + last 3 messages (capped 3000 chars each) + everything older as digest. Hard-capped at budget_chars (default 16000). Params: recent (1-10), budget_chars.
-   d. GET /messages?game=<id>&tail=N .............. last N messages in full. N=10 is usually enough.
-   e. GET /messages?game=<id>&q=<keyword> ........  server-side search, newest-last. Add &tail=N&max_chars=M to bound it. Also: agent=<A,C>, type=<T>, from_line=<L>, format=json.
-   f. GET /guide .................................. this document (text or ?format=json).
-   Full protocol + endpoint reference lives at GET /guide. JSON variants exist for every read endpoint (machine parsing).
+# ---------------------------------------------------------------- writing
 
-3. LIVE POLL LOOP (how to watch without burning context)
-   Poll GET /stats every 30-60s (NOT /messages). Remember last_line.
-   When last_line advances: GET /messages?game=<id>&from_line=<last_line+1>&max_chars=4000
-   That fetches ONLY what is new. Never re-pull the full channel to check for updates.
+def append_message(game, agent, text, msg_type=None, to=None):
+    """Append one message. Returns ({line, agent, type, mentions}, error).
 
-4. WRITE RULES
-   Identity: prefix EVERY message with your agent name + colon. Valid: Antigravity:/OpenCode:/Cursor:/Cline:/Claude:/Codex:/Qwen:/Deepseek:/Kimi:/ZCode:. Human: is reserved for the human via the UI.
-   One message = one line-group (first line carries the prefix; continuation lines carry the body). Keep it under 2000 chars; split long reports across messages.
-   Every game edit requires a change notice with exactly: (1) what changed, (2) files/instances modified, (3) verification status.
-   Two ways to post:
-     - File agents: python append_hub_entry.py <entry_file> --hub "<channel file>"  (--i-mean-the-default-channel only for the default Nen channel)
-     - HTTP agents:  POST /agent_append?game=<id>  body {"agent":"YourName","text":"..."}  (max 2000 chars, prefix applied server-side, embedded fake prefixes are quoted)
-   NEVER rewrite history: append only. Never edit or delete another agent's lines. Never cross-post between per-game files.
-   Per-game isolation: one channel file per game ("AI INTERCONNECTION CENTER - <Game>.txt"). Blank slate: never import memories, code, or decisions from another game's file.
-   Tree duty: after landing a system change, update the project tree (POST /tree with expected_version, or channel_cli.py tree-set) so the next agent inherits current context. General knowledge goes in the tree; only decisions, numbers, and questions go in the chat.
-   Brief voice: facts first, no greetings, no recaps. Keep numbers, paths, file names, and negations (not/never/no/only) byte-exact. Run long drafts through POST /brief-it (or channel_cli.py brief-it) before posting. Code, commands, and error text pass through verbatim - show changed lines, not whole files.
-   Simple-first code (ponytail rule): the smallest thing that works ships. No speculative abstraction (no Manager/Provider/Factory unless two call sites demand it), no TODOs left behind, no magic numbers that matter. Run code through POST /simple (or channel_cli.py simple) before posting it; OVERBUILT verdicts must be trimmed before sync.
-
-5. ENDPOINT REFERENCE (base http://127.0.0.1:19843)
-   GET  /games ........................ list channels: id, label, bytes, messages, est_tokens, last_agent
-   GET  /health ....................... {"ok":true} liveness probe
-   GET  /tree?game=<id>[&format=text|json]  project tree: systems/files/invariants (~1-3k tokens, read FIRST)
-   POST /tree?game=<id> ............... update tree {"agent","tree":[...],"expected_version":N} (409 on version conflict)
-   POST /delete_game ................... remove project {"game","confirm_understand":true,"confirm_name":"<exact id>","confirm_irreversible":"DELETE"} (triple confirm; default channel protected; files go to .trash/)
-   GET  /kmap?game=<id> ................... knowledge map: gods + communities (~1k tokens)
-   GET  /kmap/query?game=<id>&q=<words> .... scoped subgraph with line refs
-   GET  /kmap/path?game=<id>&a=<A>&b=<B> ... shortest connection A->B
-   GET  /kmap/explain?game=<id>&node=<N> ... one concept + its connections
-   POST /brief-it ........................ condenses text {"text"} -> {brief, saved_pct}; code/numbers/negations untouched
-   POST /simple .......................... YAGNI review {"code"} -> {verdict SIMPLE/TRIM/OVERBUILT, findings}
-   GET  /stats?game=<id> .............. channel census (~50 tokens)
-   GET  /digest?game=<id>[&per_msg=180][&max_msgs=0][&agent=][&type=][&q=][&format=json|text]
-   GET  /brief?game=<id>[&recent=3][&budget_chars=16000][&format=json|text]
-   GET  /messages?game=<id>[&tail=N][&from_line=L][&max_chars=M][&q=][&agent=][&type=][&format=json|text]  (no params = legacy full dump, avoid on large channels)
-   POST /messages?game=<id> ........... human composer {"text":"..."} (prefix Human: applied server-side)
-   POST /agent_append?game=<id> ........ agents {"agent":"Name","text":"..."}
-   POST /new_game ..................... {"title":"Game Title"} creates a channel file
-   Token heuristic everywhere: est_tokens = chars/4. Digest truncation drops oldest-first. Brief caps each recent message at 3000 chars (fetch remainder via from_line).
-"""
-
-WRITE_AGENTS = ("Antigravity", "OpenCode", "Cursor", "Cline", "Claude", "Codex", "Qwen", "Deepseek", "Kimi", "ZCode")
+    Cross-process locked, so the server, the CLI and append_hub_entry.py
+    can all write at once. Keeps the file's own line endings.
+    """
+    path = game_path(game)
+    if path is None:
+        return None, "Unknown channel '%s'. GET /games lists them." % game
+    game = os.path.basename(path)
+    canon = store.resolve_agent(agent)
+    if not canon:
+        return None, "Unknown agent '%s'. Known: %s. Add agents in Settings > Agents." % (
+            agent, ", ".join(store.agent_names()))
+    a = store.get_agent(canon)
+    if a and a["archived"]:
+        return None, "Agent '%s' is archived. Restore it in Settings > Agents." % canon
+    if not isinstance(text, str) or not text.replace("\r", "").strip():
+        return None, "Empty message."
+    clean = text.replace("\r", "").strip()
+    limit = store.load_config()["settings"]["max_message_chars"]
+    if len(clean) > limit:
+        return None, "Message too long (%d chars, max %d). Split it, or put detail in the tree or a task." % (len(clean), limit)
+    t = normalize_type(msg_type)
+    if t == "":
+        return None, "Unknown type '%s'. Use one of: %s." % (msg_type, ", ".join(POST_TYPES))
+    recipients = []
+    for name in (to or []):
+        canon_to = "all" if str(name).lower() in ("all", "everyone") else store.resolve_agent(name)
+        if not canon_to:
+            return None, "Unknown recipient '%s'." % name
+        if canon_to not in recipients:
+            recipients.append(canon_to)
+    # a body line that looks like "Name: ..." would forge a new message
+    guarded = ["> " + ln if match_agent_line(ln) else ln for ln in clean.split("\n")]
+    with store.FileLock(path):
+        with open(path, "rb") as f:
+            data = f.read()
+        nl = b"\r\n" if data.count(b"\r\n") * 2 > data.count(b"\n") else b"\n"
+        stripped = data.rstrip(b"\r\n")
+        trailing = data[len(stripped):].count(b"\n")
+        prefix = b"" if not stripped or trailing >= 2 else (nl if trailing == 1 else nl + nl)
+        line_no = (data + prefix).count(b"\n") + 1
+        body = ("%s: %s" % (canon, "\n".join(guarded))).encode("utf-8").replace(b"\n", nl) + nl
+        with open(path, "ab") as f:
+            f.write(prefix + body)
+        store.append_meta(game, {"line": line_no, "ts": store.now_iso(), "agent": canon,
+                                 "type": t, "to": recipients})
+    mentions = extract_mentions(clean)
+    for r in recipients:
+        if r not in mentions:
+            mentions.append(r)
+    return {"line": line_no, "agent": canon, "type": t or classify_type(clean[:800]),
+            "mentions": mentions}, ""
 
 
 def append_agent_message(game, agent, text):
-    """Append an agent message to a channel. Returns (ok, error)."""
-    if agent not in WRITE_AGENTS:
-        return None, "Unknown agent. Valid: %s." % (", ".join(WRITE_AGENTS))
-    if not isinstance(text, str):
-        return None, "Empty message."
-    clean = text.replace("\r", "").strip()
-    if not clean:
-        return None, "Empty message."
-    if len(clean) > 2000:
-        return None, "Message too long (max 2000 chars)."
-    guarded = []
-    for line in clean.split("\n"):
-        if AGENT_RE.match(line):
-            guarded.append("> " + line)
-        else:
-            guarded.append(line)
-    path = None
-    for g in list_games():
-        if g["id"] == game:
-            path = os.path.join(ROOT, g["id"])
-            break
-    if path is None:
-        return None, "Unknown channel."
-    with open(path, "a", encoding="utf-8") as f:
-        f.write("\n%s: %s\n" % (agent, "\n".join(guarded)))
-    return True, ""
+    """Back-compat wrapper (v2 API)."""
+    res, err = append_message(game, agent, text)
+    return (True, "") if res else (None, err)
 
+
+def append_human_message(game, text):
+    res, err = append_message(game, HUMAN, text)
+    return (True, "") if res else (None, err)
+
+
+# ---------------------------------------------------------------- project tree
 
 TREE_MAX_CHARS = 60000
 TREE_MAX_NODES = 300
@@ -392,11 +462,8 @@ TREE_MAX_DETAIL = 600
 
 
 def tree_path(game):
-    """Sidecar file for a channel's project tree. None if unknown channel."""
-    for g in list_games():
-        if g["id"] == game:
-            return os.path.join(ROOT, g["id"] + ".tree.json")
-    return None
+    path = game_path(game)
+    return path + ".tree.json" if path else None
 
 
 def blank_tree():
@@ -407,15 +474,9 @@ def load_tree(game):
     path = tree_path(game)
     if path is None:
         return None, None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            t = json.load(f)
-    except FileNotFoundError:
-        return dict(blank_tree()), path
-    except (ValueError, OSError):
-        t = dict(blank_tree())
+    t = store.read_json(path, None)
     if not isinstance(t, dict) or not isinstance(t.get("roots"), list):
-        t = dict(blank_tree())
+        t = blank_tree()
     t.setdefault("version", 0)
     return t, path
 
@@ -478,47 +539,40 @@ def render_tree_text(roots, max_chars=12000):
 
 
 def save_tree(game, agent, roots, expected_version):
-    import datetime
+    canon = store.resolve_agent(agent)
+    if not canon:
+        return None, "Unknown agent. Valid: %s." % ", ".join(store.agent_names())
     t, path = load_tree(game)
     if t is None:
         return None, "Unknown channel."
-    if agent not in WRITE_AGENTS:
-        return None, "Unknown agent. Valid: %s." % (", ".join(WRITE_AGENTS))
     try:
         exp = int(expected_version)
     except (TypeError, ValueError):
         return None, "expected_version (int) is required - GET /tree first, then send back its version."
-    if exp != int(t.get("version", 0)):
-        return None, "Version conflict: tree is at v%d, you sent expected_version=%s. Re-fetch GET /tree and re-apply your change." % (t.get("version", 0), expected_version)
     roots, err = validate_tree_roots(roots)
     if err:
         return None, err
-    t["roots"] = roots
-    t["version"] = exp + 1
-    t["updated_by"] = agent
-    t["updated_at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(t, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, path)
+    with store.FileLock(path):  # version check + write must be atomic
+        t, path = load_tree(game)
+        if exp != int(t.get("version", 0)):
+            return None, ("Version conflict: tree is at v%d, you sent expected_version=%s. "
+                          "Re-fetch GET /tree and re-apply your change." % (t.get("version", 0), expected_version))
+        t["roots"] = roots
+        t["version"] = exp + 1
+        t["updated_by"] = canon
+        t["updated_at"] = store.now_iso()
+        store.write_json(path, t)
     return t, ""
 
 
-DEFAULT_CHANNEL_ID = "AI INTERCONNECTION CENTER.txt"
-
+# ---------------------------------------------------------------- project lifecycle
 
 def delete_game(game, confirm_understand, confirm_name, confirm_irreversible):
-    """Triple-confirmed project removal. Returns (payload, error).
+    """Confirmed project removal. Returns (payload, error).
 
-    All three confirmations must be present and exact, otherwise nothing
-    is touched. Removed files are moved to .trash/ (not unlinked) so a
-    mistaken deletion is recoverable from disk. The default channel is
-    never deletable through this path.
+    Files move to .trash/ (never unlinked). The default channel is protected.
     """
-    for g in list_games():
-        if g["id"] == game:
-            break
-    else:
+    if game_path(game) is None or not game:
         return None, "Unknown channel."
     if game == DEFAULT_CHANNEL_ID:
         return None, "The default channel (%s) cannot be deleted." % DEFAULT_CHANNEL_ID
@@ -528,10 +582,9 @@ def delete_game(game, confirm_understand, confirm_name, confirm_irreversible):
         return None, "Step 2/3 missing: retype the exact channel file name."
     if confirm_irreversible != "DELETE":
         return None, "Step 3/3 missing: type DELETE to accept removal."
-    import datetime
     trash = os.path.join(ROOT, ".trash")
     os.makedirs(trash, exist_ok=True)
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     moved, freed = [], 0
     for fname in (game, game + ".tree.json"):
         src = os.path.join(ROOT, fname)
@@ -542,14 +595,63 @@ def delete_game(game, confirm_understand, confirm_name, confirm_irreversible):
                 pass
             os.replace(src, os.path.join(trash, stamp + "__" + fname))
             moved.append(fname)
+    pdir = store.project_dir(game)
+    if os.path.isdir(pdir):
+        os.replace(pdir, os.path.join(trash, stamp + "__" + os.path.basename(pdir) + ".aic"))
+        moved.append(os.path.relpath(pdir, ROOT))
     return {"trashed": moved, "bytes_reclaimed": freed}, ""
 
+
+TITLE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _'\-]{0,60}$")
+
+
+def valid_title(title):
+    return isinstance(title, str) and bool(TITLE_RE.match(title.strip()))
+
+
+def channel_template(game_id, title):
+    q = quote(game_id)
+    return (
+        "# " + game_id + "\n"
+        "# Shared channel where the AI agents and the human coordinate on '" + title + "'.\n"
+        "# It is the team's chat log and handoff record, not game content.\n"
+        "# Messages: 'AgentName: text' blocks, append-only. Never edit or delete others' lines.\n"
+        "# Blank slate: never import memories, code or decisions from another project's channel.\n"
+        "# Live view:  " + base_url() + "/?game=" + q + "\n"
+        "# AGENTS:     GET " + base_url() + "/guide once, then every turn:\n"
+        "#             GET " + base_url() + "/sync?game=" + q + "&agent=<YourName>&since=<cursor>\n"
+    )
+
+
+def create_game(title):
+    """Create a new per-game channel file. Returns (game_id, created)."""
+    clean = title.strip() if isinstance(title, str) else ""
+    if not valid_title(clean):
+        return None, False
+    game_id = CHANNEL_PREFIX + " - " + clean + ".txt"
+    for existing in channel_ids():  # case-insensitive filesystems
+        if existing.lower() == game_id.lower():
+            return existing, False
+    path = os.path.join(ROOT, game_id)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(channel_template(game_id, clean))
+    store.save_project(game_id, label=clean)
+    return game_id, True
+
+
+
+# ---------------------------------------------------------------- knowledge map
 
 KMAP_CACHE = {}
 KMAP_MAX_ENTITIES = 250
 KMAP_FILE_RE = re.compile(r"\b(?:src/|horror_src/|dist/)[\w\-./]+\.\w+|\b[\w\-]+\.(?:luau|lua|py|js|md|txt|json)\b")
 KMAP_TICK_RE = re.compile(r"`([^`\n]{2,60})`")
 KMAP_CAMEL_RE = re.compile(r"\b[A-Z][A-Za-z0-9]{5,40}\b")
+# capitalised words that start sentences and labels, not project concepts
+KMAP_STOP = {"change", "notice", "changed", "verified", "verification", "status", "before", "after",
+             "files", "checks", "tested", "because", "however", "should", "update", "updated", "fixed",
+             "added", "removed", "created", "result", "results", "summary", "action", "required",
+             "deliverables", "diagnostic", "report", "online", "standing", "follow", "please", "currently"}
 
 
 def kmap_entities(text):
@@ -563,9 +665,9 @@ def kmap_entities(text):
         t = m.strip()
         if t and len(t) <= 40 and " " not in t:
             found.append(t)
-    agents_lower = {a.lower() for a in AGENTS}
+    agents_lower = {a.lower() for a in store.agent_names()}
     for m in KMAP_CAMEL_RE.findall(nobracket):
-        if m.lower() not in agents_lower:
+        if m.lower() not in agents_lower and m.lower() not in KMAP_STOP:
             found.append(m)
     # de-dupe, keep order
     seen, out = set(), []
@@ -613,7 +715,7 @@ def build_kmap(game):
                           "degree": 0, "msgs": []}
         return nodes[nid]
 
-    for a in AGENTS:
+    for a in store.agent_names():
         add_node("agent:" + a, "agent", a)
     for it in items:
         mid = "msg:%d" % it["line"]
@@ -831,6 +933,9 @@ def kmap_explain(km, name, top_n=25, top_msgs=5):
             "connections": conns[:top_n], "refs": refs}
 
 
+
+# ---------------------------------------------------------------- brief-it + simplicity review
+
 BRIEF_FILLER = [
     (re.compile(r"\bin order to\b", re.I), "to"),
     (re.compile(r"\bdue to the fact that\b", re.I), "because"),
@@ -995,1253 +1100,1089 @@ def simplicity_check(code, max_func_lines=60, max_depth=4):
                        "abstractions": abstr, "magic_numbers": magic}}
 
 
-TITLE_PATTERN = None  # compiled lazily
+
+# ---------------------------------------------------------------- agent protocol
+
+def guide_text(base=None):
+    b = base or base_url()
+    names = "/".join(a["name"] for a in store.roster(include_archived=False))
+    return """AI INTERCONNECTION CENTER - AGENT PROTOCOL  (v{ver}; fetch once per session)
+Several AI agents and one human work on the same project. This hub is how you
+stay in sync without re-reading history. Base URL: {b}
+Every endpoint takes ?game=<channel id> (GET /games lists them; omit = default channel).
+
+1. EVERY TURN: ONE CALL
+   GET /sync?game=<id>&agent=<You>&since=<cursor>
+   -> new messages since your cursor (full if small, else digest + the ones addressed to you in full),
+      your open tasks, paths other agents have claimed, team status, tree/rules changes, and a new cursor.
+   First call: omit since. Keep the cursor it returns and send it next time. That is the whole read loop.
+
+2. BEFORE EDITING FILES: CLAIM THEM
+   POST /claim {{"game":..,"agent":"You","paths":["src/a.lua","src/ui/"],"note":"why","ttl_min":30}}
+   409 = someone else holds an overlapping path (folders and globs overlap their contents).
+   Pick other work or @mention the holder. Re-claiming the same paths renews the lease.
+   POST /release {{"game":..,"agent":"You","all":true}} when done (or "id":"C3" / "paths":[..]).
+
+3. AFTER EVERY CHANGE: CHANGE NOTICE
+   POST /post {{"game":..,"agent":"You","type":"Change Notice","text":"WHAT: ..\\nFILES: ..\\nVERIFIED: how / NOT verified: what"}}
+   Types: {types}. Address people with @Name (or "to":["Name"]); @Human asks the human; @all for everyone.
+   Max {maxc} chars per message; longer detail belongs in the tree or a task.
+
+4. TASKS
+   GET  /tasks?game=..[&assignee=You][&status=todo,doing]
+   POST /tasks {{"game","agent","title","detail","assignee","paths"}}          create (ids T1, T2..)
+   POST /tasks/update {{"game","agent","id":"T3","status":"doing|review|done","assignee":..}}
+
+5. SHARED CONTEXT
+   GET  /tree?game=..&format=text ..... project tree: systems, files, invariants. Read it when /sync says it changed.
+   POST /tree {{"agent","tree":[..],"expected_version":N}} after structural changes (409 = re-fetch first).
+   GET  /project?game=.. .............. label + project rules (also included in /sync when they change).
+
+6. DEEPER READS (only when you need history)
+   GET /stats (~50 tok)  /digest (1 line/msg)  /brief (digest + last 3 full)
+   GET /messages?tail=N | from_line=L&limit=1 | q=word | agent=A | type=T   (&format=json)
+   GET /kmap/query?q=words  /kmap/path?a=&b=  /kmap/explain?node=   knowledge map over the history
+   POST /brief-it {{"text"}} condense a draft   POST /simple {{"code"}} YAGNI review
+   Never GET /messages with no params on a large channel: that is the full log.
+
+7. RULES
+   Identity: use exactly your roster name ({names}). Human is the human.
+   Append-only: never edit or delete channel lines. One project per channel; never cross-post.
+   Never edit paths another agent has claimed. Write for agents: facts, paths, numbers, no greetings.
+   Status line (optional): POST /status {{"game","agent","doing":"running tests"}} shows on the human's dashboard.
+   Access keys (only if the human turned them on): header X-AIC-Key: <your key>.
+   MCP: python aic_mcp.py exposes all of this as tools (see the Connect tab in the dashboard).
+""".format(ver=APP_VERSION, b=b, types=", ".join(POST_TYPES), names=names,
+           maxc=store.load_config()["settings"]["max_message_chars"])
 
 
-def valid_title(title):
-    global TITLE_PATTERN
-    if TITLE_PATTERN is None:
-        TITLE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _'\-]{0,60}$")
-    return isinstance(title, str) and bool(TITLE_PATTERN.match(title.strip()))
+GUIDE_TEXT = guide_text()  # back-compat for channel_cli.py and older importers
 
 
-def channel_template(game_id, title):
-    return (
-        "# " + game_id + "\n"
-        "# What this file is: a shared message board where the human's AI\n"
-        "# engineers coordinate while building this game. It is not game\n"
-        "# content, documentation, or code - it is the team's chat log and\n"
-        "# handoff record. Read it before starting work; write to it as you go.\n"
-        "# Rules: prefix every message with your agent name and a colon\n"
-        "# (Antigravity:/OpenCode:/Cursor:/Cline:/Claude:/Codex:/Qwen:/Deepseek:/Kimi:/ZCode:/Human:). Keep one message per\n"
-        "# line-group. Post a change notice every time you modify the game\n"
-        "# (what changed, which files, verification result).\n"
-        "# Blank slate: never import memories, code, or decisions from another\n"
-        "# game's channel file. Treat this game as entirely new.\n"
-        "# Live view: http://127.0.0.1:19843/?game=" + quote(game_id) + "\n"
-        "# AGENTS READ THIS FIRST: GET http://127.0.0.1:19843/guide (full protocol, ~1.5k tokens, fetch once).\n"
-        "# Token-safe read ladder (NEVER pull full logs on channels over ~20KB):\n"
-        "#   GET /stats?game=" + quote(game_id) + "  (~50 tokens, poll this for updates)\n"
-        "#   GET /digest?game=" + quote(game_id) + "  (one line per message)\n"
-        "#   GET /brief?game=" + quote(game_id) + "  (stats + last 3 capped + digest)\n"
-        "#   GET /messages?game=" + quote(game_id) + "&tail=10  (last N full only)\n"
-        "#   POST /agent_append?game=" + quote(game_id) + '  {"agent":"YourName","text":"..."} to post over HTTP\n'
-        "#   GET /tree?game=" + quote(game_id) + "&format=text  (project context tree - read BEFORE chat history)\n"
-    )
+def rules_signature(game):
+    p = store.load_project(game)
+    return p["updated_at"] if p["rules"] else ""
 
 
-def create_game(title):
-    """Create a new per-game channel file. Returns (game_id, created)."""
-    clean = title.strip()
-    if not valid_title(clean):
-        return None, False
-    game_id = CHANNEL_PREFIX + " - " + clean + ".txt"
-    path = os.path.join(ROOT, game_id)
-    if os.path.exists(path):
-        return game_id, False
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(channel_template(game_id, clean))
-    return game_id, True
+def build_sync(game, agent, since, max_chars=6000):
+    """Everything an agent needs this turn, in one bounded payload."""
+    items, _chars = load_items(game)
+    cursor = items[-1]["line"] if items else 0
+    first = since is None
+    new = items[-5:] if first else [it for it in items if it["line"] > since]
+    others = [it for it in new if it["agent"] != agent]
+    # direct @mentions come back in full; broadcasts ([TO: ALL], @all) only when everything fits
+    addressed = [it for it in others if agent in it["mentions"]] if not first else []
+    full = sum(it["chars"] for it in others) <= max_chars and not first
+    tasks = store.list_tasks(game)
+    mine = [t for t in tasks if t["assignee"] == agent and t["status"] != "done"]
+    unassigned = [t for t in tasks if not t["assignee"] and t["status"] == "todo"]
+    claims = store.active_claims(game)
+    others_claims = [c for c in claims if c["agent"] != agent]
+    my_claims = [c for c in claims if c["agent"] == agent]
+    tree, _ = load_tree(game)
+    tv = int(tree.get("version", 0)) if tree else 0
+    tree_seen = store.presence_get(game, agent, "tree_seen")
+    rules_sig = rules_signature(game)
+    rules_seen = store.presence_get(game, agent, "rules_seen")
+    pres = store.presence(game)
+    now = time.time()
+    team = [{"agent": a, "ago_s": int(now - p["seen"]), "doing": p.get("doing", ""), "state": p.get("state", "")}
+            for a, p in sorted(pres.items(), key=lambda kv: -kv[1]["seen"])
+            if a != agent and now - p["seen"] < 1800]
+    store.touch(game, agent, tree_seen=tv, rules_seen=rules_sig)
+    project = store.load_project(game)
 
+    def render(it, cap):
+        body = it["text"]
+        if len(body) > cap:
+            body = body[:cap] + "\n...[cut, full: GET /messages?game=<id>&from_line=%d&limit=1]" % it["line"]
+        return body
 
-PAGE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AI Interconnection Center</title>
-<style>
-  :root {
-    --bg: #0d0f14; --panel: #14171f; --panel2: #191d27; --border: #2a3040;
-    --text: #e8eaf0; --dim: #9aa0b4;
-    --antigravity: #50cdff; --opencode: #78f5b4; --cursor: #b79bff;
-    --cline: #F2C94C; --claude: #E09142;     --codex: #ff7eb6;
-    --qwen: #22d3ee; --deepseek: #f87171; --kimi: #a3a3a3; --zcode: #84cc16;
-    --human: #f5f7ff; --system: #8a90a3; --accent: #78f5b4;
-  }
-  * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--text);
-    font-family: "Segoe UI", system-ui, -apple-system, Arial, sans-serif;
-    font-size: 14px; line-height: 1.55; }
-  header { position: sticky; top: 0; z-index: 10;
-    background: rgba(13,15,20,.96); border-bottom: 1px solid var(--border);
-    padding: 12px 20px; }
-  header h1 { margin: 0 0 2px; font-size: 18px; letter-spacing: .5px; }
-  header p { margin: 0; color: var(--dim); font-size: 12px; }
-  .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
-    padding: 10px 20px; border-bottom: 1px solid var(--border);
-    background: var(--panel); position: sticky; top: 73px; z-index: 9; }
-  .row2 { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
-    padding: 8px 20px; border-bottom: 1px solid var(--border); background: var(--panel); }
-  .chip { border: 1px solid var(--border); background: var(--panel2); color: var(--text);
-    border-radius: 999px; padding: 4px 12px; cursor: pointer; font-size: 12px; }
-  .chip.off { opacity: .35; } .chip.on { border-color: var(--accent); color: var(--accent); }
-  .gtab { border: 1px solid var(--border); background: var(--panel2); color: var(--text);
-    border-radius: 8px; padding: 5px 12px; cursor: pointer; font-size: 13px; font-weight: 600; }
-  .gtab.active { border-color: var(--opencode); color: var(--opencode); }
-  .chip .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
-  #search { flex: 1; min-width: 160px; background: var(--bg); color: var(--text);
-    border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; font-size: 13px; }
-  select, input[type=number] { background: var(--bg); color: var(--text);
-    border: 1px solid var(--border); border-radius: 8px; padding: 5px 8px; font-size: 12px; }
-  #stats { color: var(--dim); font-size: 12px; padding: 8px 20px 0; }
-  #tokenmeter { color: var(--dim); font-size: 12px; padding: 4px 20px 0; }
-  #tokenmeter b { color: var(--accent); }
-  #feed { padding: 12px 0 60px; }
-  #main { display: flex; gap: 18px; max-width: 1400px; margin: 0 auto; padding: 0 20px; align-items: flex-start; }
-  #leftcol { flex: 1; min-width: 0; }
-  #treepanel { width: 340px; flex-shrink: 0; position: sticky; top: 10px; max-height: calc(100vh - 20px); overflow: auto;
-    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
-  #treepanel h3 { margin: 2px 0 6px; font-size: 13px; letter-spacing: .4px; }
-  #treemeta { font-size: 11px; color: var(--dim); margin-bottom: 6px; }
-  #treefilter { width: 100%; margin-bottom: 6px; background: var(--bg); color: var(--text);
-    border: 1px solid var(--border); border-radius: 8px; padding: 5px 8px; font-size: 12px; }
-  .tnode { font-size: 12.5px; margin: 2px 0; }
-  .tnode .trow { cursor: pointer; border-radius: 6px; padding: 2px 6px; }
-  .tnode .trow:hover { background: var(--panel2); }
-  .tnode .ttitle { font-weight: 600; }
-  .tnode .tdetail { color: var(--dim); font-size: 12px; }
-  .tnode .trefs { color: var(--accent); font-size: 11px; }
-  .tkids { margin-left: 12px; border-left: 1px solid var(--border); padding-left: 6px; }
-  .tkids.hide { display: none; }
-  .deephit { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; margin: 6px 0; font-size: 12.5px; }
-  @media (max-width: 1100px) { #treepanel { display: none; } }
-  .msg { background: var(--panel); border: 1px solid var(--border);
-    border-left: 4px solid var(--system); border-radius: 10px; padding: 10px 14px; margin: 10px 0; }
-  .msg.Antigravity { border-left-color: var(--antigravity); }
-  .msg.OpenCode { border-left-color: var(--opencode); }
-  .msg.Cursor { border-left-color: var(--cursor); }
-  .msg.Cline { border-left-color: var(--cline); }
-  .msg.Claude { border-left-color: var(--claude); }
-  .msg.Codex { border-left-color: var(--codex); }
-  .msg.Qwen { border-left-color: var(--qwen); }
-  .msg.Deepseek { border-left-color: var(--deepseek); }
-  .msg.Kimi { border-left-color: var(--kimi); }
-  .msg.ZCode { border-left-color: var(--zcode); }
-  .msg.Human { border-left-color: var(--human); }
-  .meta { display: flex; gap: 10px; align-items: baseline; margin-bottom: 4px; flex-wrap: wrap; }
-  .agent { font-weight: 700; font-size: 13px; }
-  .msg.Antigravity .agent { color: var(--antigravity); } .msg.OpenCode .agent { color: var(--opencode); }
-  .msg.Cursor .agent { color: var(--cursor); } .msg.Cline .agent { color: var(--cline); }
-  .msg.Claude .agent { color: var(--claude); }   .msg.Codex .agent { color: var(--codex); }
-  .msg.Qwen .agent { color: var(--qwen); } .msg.Deepseek .agent { color: var(--deepseek); }
-  .msg.Kimi .agent { color: var(--kimi); } .msg.ZCode .agent { color: var(--zcode); }
-  .msg.Human .agent { color: var(--human); }
-  .line { color: var(--dim); font-size: 11px; margin-left: auto; white-space: nowrap; }
-  .typepill { font-size: 11px; border: 1px solid var(--border); border-radius: 999px;
-    padding: 0 8px; color: var(--dim); }
-  .body { white-space: pre-wrap; word-break: break-word; }
-  .body.collapsed { max-height: 132px; overflow: hidden; position: relative; }
-  .body .tag { color: #ffd75e; font-weight: 600; }
-  .more { color: var(--accent); cursor: pointer; font-size: 12px; margin-top: 4px; display: inline-block; }
-  .digestrow { display: flex; gap: 8px; align-items: baseline; background: var(--panel);
-    border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; margin: 6px 0;
-    font-size: 12.5px; cursor: pointer; }
-  .digestrow:hover { border-color: var(--accent); }
-  .sys { color: var(--dim); background: transparent; border: 1px dashed var(--border);
-    border-radius: 10px; padding: 8px 14px; margin: 10px 0; font-size: 12.5px; white-space: pre-wrap; }
-  #status { font-size: 12px; color: var(--dim); } #status .live { color: #6dffa8; }
-  .briefcard { background: var(--panel2); border: 1px solid var(--accent); border-radius: 10px;
-    padding: 10px 14px; margin: 10px 0; font-size: 12.5px; white-space: pre-wrap; }
-  kbd { border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; font-size: 11px; }
-</style>
-</head>
-<body>
-<header>
-  <h1>AI INTERCONNECTION CENTER <span style="font-size:11px; color:var(--dim); font-weight:400;">v2.4.0</span></h1>
-  <p><span id="gamelabel">loading games&hellip;</span> &middot; <span id="status">connecting&hellip;</span></p>
-  <div id="gametabs" style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;"></div>
-  <div id="newgame" style="margin-top:8px; display:none; gap:8px; align-items:center;">
-    <input id="newgametitle" type="text" placeholder="Game title (letters, digits, spaces)" maxlength="61"
-      style="background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:6px 10px; font-size:13px; width:260px;">
-    <button class="gtab" id="creategame">Create channel</button>
-    <button class="gtab" id="cancelgame">Cancel</button>
-    <span id="newgameerr" style="color:#ff7b8a; font-size:12px;"></span>
-  </div>
-  <div id="aibanner" style="margin-top:8px; font-size:12px; color:var(--dim);">AGENTS: fetch <a href="/guide" target="_blank" style="color:var(--accent);">/guide</a> + <a href="#" id="banner-tree" style="color:var(--accent);">project tree</a> once, then poll <span style="color:var(--text);">/stats</span> — never pull full logs. Human observers: everything below is the live agent discussion.</div>
-</header>
-<div class="controls">
-  <button class="chip" data-agent="Antigravity"><span class="dot" style="background:var(--antigravity)"></span>Antigravity</button>
-  <button class="chip" data-agent="OpenCode"><span class="dot" style="background:var(--opencode)"></span>OpenCode</button>
-  <button class="chip" data-agent="Cursor"><span class="dot" style="background:var(--cursor)"></span>Cursor</button>
-  <button class="chip" data-agent="Cline"><span class="dot" style="background:var(--cline)"></span>Cline</button>
-  <button class="chip" data-agent="Claude"><span class="dot" style="background:var(--claude)"></span>Claude</button>
-  <button class="chip" data-agent="Codex"><span class="dot" style="background:var(--codex)"></span>Codex</button>
-  <button class="chip" data-agent="Qwen"><span class="dot" style="background:var(--qwen)"></span>Qwen</button>
-  <button class="chip" data-agent="Deepseek"><span class="dot" style="background:var(--deepseek)"></span>Deepseek</button>
-  <button class="chip" data-agent="Kimi"><span class="dot" style="background:var(--kimi)"></span>Kimi</button>
-  <button class="chip" data-agent="ZCode"><span class="dot" style="background:var(--zcode)"></span>ZCode</button>
-  <button class="chip" data-agent="Human"><span class="dot" style="background:var(--human)"></span>Human</button>
-  <button class="chip" id="pause">Pause live</button>
-  <input id="search" type="text" placeholder="Search messages&hellip; (filters current view)" autocomplete="off">
-</div>
-<div class="row2">
-  <span style="font-size:12px;color:var(--dim)">View:</span>
-  <button class="chip on" data-view="full">Full</button>
-  <button class="chip" data-view="compact">Compact</button>
-  <button class="chip" data-view="brief">AI Brief</button>
-  <span style="font-size:12px;color:var(--dim)">Show:</span>
-  <select id="tailsel">
-    <option value="0">All</option>
-    <option value="10">Last 10</option>
-    <option value="25" selected>Last 25</option>
-    <option value="50">Last 50</option>
-    <option value="100">Last 100</option>
-  </select>
-  <span style="font-size:12px;color:var(--dim)">Type:</span>
-  <select id="typesel">
-    <option value="all">All types</option>
-    <option>Change Notice</option><option>Advisory</option><option>Discussion</option>
-    <option>Review</option><option>Fix</option><option>VFX</option>
-    <option>Verify</option><option>Protocol</option><option>Status</option>
-    <option>Tool</option><option>General</option>
-  </select>
-  <button class="chip on" id="collapsebtn" title="Collapse messages over ~900 chars">Collapse long</button>
-  <button class="chip" id="newestbtn" title="Show newest messages first">Newest first: off</button>
-  <span style="font-size:12px;color:var(--dim)">Refresh:</span>
-  <select id="refsel"><option value="2500">2.5s</option><option value="5000">5s</option><option value="15000">15s</option><option value="0">Off</option></select>
-</div>
-<div class="row2">
-  <button class="gtab" id="copyview" title="Copy current view as text">Copy view</button>
-  <button class="gtab" id="copydigest" title="Copy token-efficient digest (paste to an AI)">Copy AI digest</button>
-  <button class="gtab" id="dljson">Export JSON</button>
-  <button class="gtab" id="dldigest">Export digest</button>
-  <button class="gtab" id="jumptop">Jump top</button>
-  <button class="gtab" id="jumplatest">Jump latest</button>
-  <button class="gtab" id="protocolbtn" title="Show the in-app agent protocol (/guide)">AI Protocol</button>
-  <button class="gtab" id="kmapbtn" title="Knowledge map: gods, communities, ask questions">K-map</button>
-  <button class="gtab" id="dlappbtn" title="Download this app as a zip">Download app</button>
-  <button class="gtab" id="delbtn" title="Delete a project channel (triple confirmation)">Delete project</button>
-  <span style="font-size:11px;color:var(--dim)">Keys: <kbd>/</kbd> search <kbd>c</kbd> copy digest <kbd>1/2/3</kbd> views</span>
-</div>
-<div id="protocolpanel" style="display:none; margin:0 20px; background:var(--panel2); border:1px solid var(--accent); border-radius:10px; padding:10px 14px;">
-  <div style="display:flex; gap:8px; align-items:center; margin-bottom:6px;">
-    <b style="font-size:13px;">Agent protocol (served live from <span style="color:var(--accent);">/guide</span>)</b>
-    <button class="gtab" id="copyprotocol" style="margin-left:auto;">Copy protocol</button>
-    <button class="gtab" id="closeprotocol">Close</button>
-  </div>
-  <pre id="protocoltext" style="white-space:pre-wrap; font-size:12px; margin:0; max-height:320px; overflow:auto;">loading…</pre>
-</div>
-<div id="composerbar" style="display:flex; gap:8px; align-items:flex-start; padding:10px 20px; border-bottom:1px solid var(--border); background:var(--panel);">
-  <span class="chip" style="cursor:default; border-color:var(--human); flex-shrink:0;">You &middot; Human</span>
-  <textarea id="composer" rows="2" placeholder="Type a message as Human... (Ctrl+Enter to send)" style="flex:1; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:6px 10px; font-size:13px; resize:vertical; font-family:inherit;"></textarea>
-  <button class="gtab" id="briefbtn" style="flex-shrink:0;" title="Condense draft: facts first, fluff out">Brief it</button>
-  <button class="gtab" id="sendbtn" style="flex-shrink:0;">Send</button>
-  <span id="composererr" style="color:#ff7b8a; font-size:12px; align-self:center;"></span>
-</div>
-<div id="delmodal" style="display:none; position:fixed; inset:0; z-index:50; background:rgba(0,0,0,.65); align-items:center; justify-content:center;">
-  <div style="background:var(--panel); border:1px solid #ff5b6e; border-radius:12px; padding:18px; width:440px; max-width:92vw;">
-    <div style="display:flex; align-items:center; gap:8px;">
-      <b style="font-size:14px; color:#ff7b8a;">Delete project — are you sure? (3 confirmations)</b>
-      <button class="gtab" id="delclose" style="margin-left:auto;">X</button>
-    </div>
-    <div id="delstep1" style="margin-top:10px;">
-      <div style="font-size:12px; color:var(--dim);">Step 1/3 — pick the project. It (and its tree) leaves the app. Files are moved to .trash/ on disk, recoverable by hand.</div>
-      <select id="delsel" style="width:100%; margin-top:8px;"></select>
-      <label style="display:flex; gap:8px; margin-top:8px; font-size:13px; cursor:pointer;"><input type="checkbox" id="delack"> I understand this removes the project from the app.</label>
-      <div style="margin-top:10px; display:flex; gap:8px;"><button class="gtab" id="delnext1">Next</button></div>
-    </div>
-    <div id="delstep2" style="margin-top:10px; display:none;">
-      <div style="font-size:12px; color:var(--dim);">Step 2/3 — retype the EXACT channel file name to prove intent.</div>
-      <div id="delwant" style="font-size:12px; margin-top:6px; color:var(--text);"></div>
-      <input id="delname" type="text" autocomplete="off" style="width:100%; margin-top:6px; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:6px 10px; font-size:13px;">
-      <div style="margin-top:10px; display:flex; gap:8px;"><button class="gtab" id="delback2">Back</button><button class="gtab" id="delnext2">Next</button></div>
-    </div>
-    <div id="delstep3" style="margin-top:10px; display:none;">
-      <div style="font-size:12px; color:var(--dim);">Step 3/3 — final. Type <b>DELETE</b> in caps. There is no undo button (files land in .trash/ on disk).</div>
-      <input id="delword" type="text" autocomplete="off" placeholder="DELETE" style="width:100%; margin-top:6px; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:6px 10px; font-size:13px;">
-      <div style="margin-top:10px; display:flex; gap:8px;"><button class="gtab" id="delback3">Back</button><button class="gtab" id="delgo" style="border-color:#ff5b6e; color:#ff7b8a;">Delete forever</button></div>
-    </div>
-    <div id="delerr" style="color:#ff7b8a; font-size:12px; margin-top:8px;"></div>
-  </div>
-</div>
-<div id="main"><div id="leftcol">
-<div id="stats"></div>
-<div id="tokenmeter"></div>
-<details id="deepsearch" style="background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:8px 12px; margin:10px 0;">
-  <summary style="cursor:pointer; font-size:13px; font-weight:600;">Chat deep-search <span style="color:var(--dim); font-weight:400;">— full history, server-side. For specific changes, mentions, questions. General context lives in the project tree (right).</span></summary>
-  <div style="display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; align-items:center;">
-    <input id="deepq" type="text" placeholder="Keyword (e.g. ChainJail, burn rate, spawn cap)..." style="flex:2; min-width:160px; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:6px 10px; font-size:13px;">
-    <select id="deepagent"><option value="">All agents</option><option>Antigravity</option><option>OpenCode</option><option>Cursor</option><option>Cline</option><option>Claude</option><option>Codex</option><option>Qwen</option><option>Deepseek</option><option>Kimi</option><option>ZCode</option><option>Human</option></select>
-    <select id="deeptype"><option value="all">All types</option><option>Change Notice</option><option>Advisory</option><option>Discussion</option><option>Review</option><option>Fix</option><option>VFX</option><option>Verify</option><option>Protocol</option><option>Status</option><option>Tool</option><option>General</option></select>
-    <select id="deepmax"><option value="10">10 hits</option><option value="25">25 hits</option><option value="50">50 hits</option></select>
-    <button class="gtab" id="deepsearchbtn">Search</button>
-    <button class="gtab" id="deepcopybtn">Copy results</button>
-  </div>
-  <div id="deepresults" style="margin-top:8px;"></div>
-</details>
-<div id="kmappanel" style="display:none; background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:8px 12px; margin:10px 0;">
-  <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-    <b style="font-size:13px;">Knowledge map</b>
-    <span id="kmapmeta" style="font-size:11px; color:var(--dim);"></span>
-    <input id="kmapq" type="text" placeholder="Ask (e.g. what breaks ChainJail?)..." style="flex:2; min-width:160px; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:6px 10px; font-size:13px;">
-    <button class="gtab" id="kmapgobtn">Ask</button>
-    <button class="gtab" id="kmapclose">Close</button>
-  </div>
-  <div id="kmapbody" style="margin-top:8px; font-size:12.5px;"></div>
-</div>
-<div id="feed"></div>
-</div><aside id="treepanel">
-  <h3>PROJECT TREE <span style="color:var(--dim); font-weight:400;">— general context, read first</span></h3>
-  <div id="treemeta">loading...</div>
-  <input id="treefilter" type="text" placeholder="Filter tree..." autocomplete="off">
-  <div style="display:flex; gap:6px; margin-bottom:6px; flex-wrap:wrap;">
-    <button class="chip" id="treecopy">Copy tree</button>
-    <button class="chip" id="treeexpand">Expand all</button>
-    <button class="chip" id="treecollapse">Collapse</button>
-  </div>
-  <div id="tree"></div>
-</aside></div>
-<script>
-const AGENTS = ["Antigravity","OpenCode","Cursor","Cline","Claude","Codex","Qwen","Deepseek","Kimi","ZCode","Human"];
-let hidden = new Set();
-let query = "", viewMode = "full", tailN = 25, typeF = "all";
-let paused = false, newestFirst = false, collapseLong = true, refreshMs = 2500, pollTimer = null;
-let lastText = null, lastItems = [], lastStats = null, lastBrief = null;
-let games = [], currentGame = null;
-let lastTreeGame = null, treeData = null, treeCollapsed = new Set(), treeFilterQ = "";
-
-function gameParam(){ try { return new URL(window.location.href).searchParams.get("game"); } catch(e){ return null; } }
-function renderTabs(){
-  const bar = document.getElementById("gametabs"); bar.innerHTML = "";
-  games.forEach((g) => {
-    const b = document.createElement("button");
-    b.className = "gtab" + (g.id === currentGame ? " active" : "");
-    b.textContent = g.label;
-    b.title = g.id + " (" + g.messages + " msgs, ~" + g.est_tokens + " tokens)";
-    b.addEventListener("click", () => {
-      if (g.id === currentGame) return;
-      currentGame = g.id; lastText = null; lastItems = [];
-      try { const u = new URL(window.location.href); u.searchParams.set("game", g.id); window.history.replaceState(null,"",u.toString()); } catch(e){}
-      document.getElementById("gamelabel").textContent = g.label;
-      renderTabs(); poll();
-    });
-    bar.appendChild(b);
-  });
-  const add = document.createElement("button");
-  add.className = "gtab"; add.textContent = "+ New game";
-  add.addEventListener("click", () => {
-    document.getElementById("newgame").style.display = "flex";
-    document.getElementById("newgameerr").textContent = "";
-    document.getElementById("newgametitle").value = "";
-    document.getElementById("newgametitle").focus();
-  });
-  bar.appendChild(add);
-}
-function closeNewGame(){ document.getElementById("newgame").style.display = "none"; }
-async function createGame(){
-  const title = document.getElementById("newgametitle").value.trim();
-  const err = document.getElementById("newgameerr");
-  if (!title){ err.textContent = "Type a game title first."; return; }
-  try {
-    const r = await fetch("/new_game", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({title}) });
-    const res = await r.json();
-    if (!res.ok){ err.textContent = res.error || "Could not create it."; return; }
-    closeNewGame(); await refreshGames();
-    const target = games.find((g)=>g.id===res.id);
-    if (target){ currentGame = target.id; lastText = null;
-      try { const u = new URL(window.location.href); u.searchParams.set("game", target.id); window.history.replaceState(null,"",u.toString()); } catch(e){}
-      document.getElementById("gamelabel").textContent = target.label; renderTabs(); poll(); }
-  } catch(e){ err.textContent = "Server unreachable."; }
-}
-async function refreshGames(){
-  try {
-    const r = await fetch("/games?t="+Date.now(), {cache:"no-store"});
-    const list = await r.json();
-    const ids = list.map((g)=>g.id).join("|"), prev = games.map((g)=>g.id).join("|");
-    games = list;
-    if (!currentGame || !list.some((g)=>g.id===currentGame)){
-      const want = gameParam();
-      currentGame = list.some((g)=>g.id===want) ? want : (list.length ? list[0].id : null);
-      lastText = null; lastItems = [];
+    return {
+        "game": game, "agent": agent, "cursor": cursor, "since": since, "first_sync": first,
+        "new_count": len(new), "own_count": len(new) - len(others),
+        "messages": [dict(message_json(it, full=False),
+                          text=render(it, 2500) if (full or it in addressed) else it["preview"][:180],
+                          addressed=it in addressed, to_all="all" in it["mentions"],
+                          full=full or it in addressed) for it in others],
+        "your_tasks": mine, "unassigned_todo": len(unassigned),
+        "claims_by_others": others_claims, "your_claims": my_claims,
+        "tree": {"version": tv, "changed": tree_seen is not None and tree_seen != tv or (first and tv > 0),
+                 "updated_by": tree.get("updated_by", "") if tree else ""},
+        "rules": project["rules"] if project["rules"] and (first or rules_seen != rules_sig) else "",
+        "team": team,
     }
-    const cur = list.find((g)=>g.id===currentGame);
-    if (cur) document.getElementById("gamelabel").textContent = cur.label;
-    if (ids !== prev) renderTabs();
-  } catch(e){}
-}
-function esc(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
-function fmtBody(s){ return esc(s).replace(/\\[([^\\]]+)\\]/g,'<span class="tag">[$1]</span>'); }
-function parse(text){
-  const lines = text.split("\\n"); const items = [];
-  let cur = null, sysBuf = [];
-  const flushSys = () => { const t = sysBuf.join("\\n").trim(); if (t) items.push({kind:"sys", text:t}); sysBuf = []; };
-  lines.forEach((raw,i)=>{
-    const line = raw.replace(/\\r$/,"");
-    const m = line.match(/^(Antigravity|OpenCode|Cursor|Cline|Claude|Codex|Qwen|Deepseek|Kimi|ZCode|Human):\\s?(.*)$/);
-    if (m){ if (cur) items.push(cur); flushSys(); cur = {kind:"msg", agent:m[1], text:m[2], line:i+1}; }
-    else if (/^#/.test(line)){ if (cur){ items.push(cur); cur=null; } sysBuf.push(line); }
-    else if (line.trim()===""){ if (cur) cur.text += "\\n"; else sysBuf.push(""); }
-    else { if (cur) cur.text += "\\n"+line; else sysBuf.push(line); }
-  });
-  if (cur) items.push(cur); flushSys(); return items;
-}
-function classifyClient(t){
-  const s = t.toLowerCase().slice(0,800);
-  if (s.includes("change notice")) return "Change Notice";
-  if (s.includes("advisory")) return "Advisory";
-  if (s.includes("discussion")) return "Discussion";
-  if (s.includes("crash")||s.includes("fix confirmation")) return "Fix";
-  if (s.includes("protocol")) return "Protocol";
-  if (s.includes("verdict")||s.includes("ruling")||s.includes("review")) return "Review";
-  if (s.includes("vfx")||s.includes("visual")) return "VFX";
-  if (s.includes("verify")||s.includes("tests pass")) return "Verify";
-  if (s.includes("[tool]")) return "Tool";
-  if (s.includes("status")||s.includes("online")) return "Status";
-  return "General";
-}
-function filtered(items){
-  let arr = items.filter((it)=>it.kind==="msg");
-  if (newestFirst) arr = arr.slice().reverse();
-  if (tailN > 0) arr = (newestFirst ? arr.slice(0,tailN) : arr.slice(-tailN));
-  return arr.filter((it)=>{
-    if (hidden.has(it.agent)) return false;
-    if (typeF !== "all" && classifyClient(it.text) !== typeF) return false;
-    if (query && it.text.toLowerCase().indexOf(query) < 0) return false;
-    return true;
-  });
-}
-function tokens(s){ return Math.max(1, Math.round(s.length/4)); }
-function render(items){
-  const feed = document.getElementById("feed");
-  const stick = (window.innerHeight + window.scrollY) >= (document.body.scrollHeight - 120);
-  feed.innerHTML = "";
-  const counts = {}; AGENTS.forEach((a)=>counts[a]=0);
-  let shownChars = 0;
-  if (viewMode === "brief" && lastBrief){
-    const d = document.createElement("div");
-    d.className = "briefcard";
-    d.textContent = lastBrief.text.slice(0,16000);
-    feed.appendChild(d);
-    document.getElementById("stats").textContent =
-      "AI Brief: " + lastBrief.digest_shown + " digested + " + lastBrief.recent_count +
-      " full (" + lastBrief.est_tokens + " tokens~). Full channel ~" +
-      (lastStats ? lastStats.est_tokens : "?") + " tokens. Digest-first reading saves ~90%.";
-    document.getElementById("tokenmeter").innerHTML =
-      "Brief <b>" + lastBrief.est_tokens + "</b> tokens~ vs full <b>" +
-      (lastStats ? lastStats.est_tokens : "?") + "</b> tokens~";
-    if (stick) window.scrollTo(0, document.body.scrollHeight);
-    return;
-  }
-  if (viewMode === "compact"){
-    let shown = 0;
-    filtered(items).forEach((it)=>{
-      counts[it.agent] = (counts[it.agent]||0)+1;
-      const one = it.text.replace(/\\s+/g," ").trim();
-      const snip = one.length > 180 ? one.slice(0,180)+"..." : one;
-      shownChars += snip.length;
-      shown++;
-      const d = document.createElement("div");
-      d.className = "digestrow"; d.title = "Click to expand full message";
-      d.innerHTML = '<b style="flex-shrink:0">'+it.agent+'</b><span class="typepill">'+classifyClient(it.text)+'</span><span style="flex:1">'+esc(snip)+'</span><span class="line">L'+it.line+'</span>';
-      d.addEventListener("click", ()=>{
-        const full = document.createElement("div");
-        full.className = "msg "+it.agent;
-        full.innerHTML = '<div class="meta"><span class="agent">'+it.agent+'</span><span class="typepill">'+classifyClient(it.text)+'</span><span class="line">line '+it.line+'</span></div><div class="body">'+fmtBody(it.text.trim())+'</div>';
-        d.replaceWith(full);
-      });
-      feed.appendChild(d);
-    });
-    const fullTok = lastStats ? lastStats.est_tokens : tokens(lastText||"");
-    document.getElementById("stats").textContent =
-      "Compact: "+shown+" shown ("+AGENTS.map((a)=>a+" "+(counts[a]||0)).join(" · ")+")";
-    document.getElementById("tokenmeter").innerHTML =
-      "View <b>"+tokens(feed.innerText)+"</b> tokens~ vs full <b>"+fullTok+"</b> tokens~ (saves ~"+Math.max(0,Math.round(100*(1-tokens(feed.innerText)/Math.max(1,fullTok))))+"%)";
-    if (stick) window.scrollTo(0, document.body.scrollHeight);
-    return;
-  }
-  let shown = 0;
-  items.forEach((it)=>{
-    if (it.kind === "sys"){ const d=document.createElement("div"); d.className="sys"; d.textContent=it.text; feed.appendChild(d); return; }
-    counts[it.agent]=(counts[it.agent]||0)+1;
-    if (hidden.has(it.agent)) return;
-    if (typeF !== "all" && classifyClient(it.text) !== typeF) return;
-    if (query && it.text.toLowerCase().indexOf(query)<0) return;
-    if (tailN > 0){
-      // tail applied on message index, not sys lines: approximate by line number window
-    }
-    shown++; shownChars += it.text.length;
-    const d = document.createElement("div"); d.className = "msg "+it.agent;
-    const long = it.text.length > 900 && collapseLong;
-    d.innerHTML = '<div class="meta"><span class="agent">'+it.agent+'</span><span class="typepill">'+classifyClient(it.text)+'</span><span class="line">line '+it.line+'</span></div>'+
-      '<div class="body'+(long?" collapsed":"")+'">'+fmtBody(it.text.trim())+'</div>'+
-      (long?'<span class="more">Show more ('+it.text.length+' chars)</span>':"");
-    if (long){ d.querySelector(".more").addEventListener("click",(e)=>{ const b=d.querySelector(".body"); b.classList.toggle("collapsed"); e.target.textContent = b.classList.contains("collapsed") ? "Show more ("+it.text.length+" chars)" : "Show less"; }); }
-    feed.appendChild(d);
-  });
-  // apply tail window in full view: keep last N message cards
-  if (tailN > 0){
-    const cards = Array.from(feed.querySelectorAll(".msg"));
-    const drop = Math.max(0, cards.length - tailN);
-    for (let i=0;i<drop;i++) cards[i].remove();
-    shown = cards.length - drop >= 0 ? feed.querySelectorAll(".msg").length : shown;
-  }
-  if (newestFirst){ const cards = Array.from(feed.querySelectorAll(".msg")).reverse(); cards.forEach((c)=>feed.appendChild(c)); }
-  const fullTok = lastStats ? lastStats.est_tokens : tokens(lastText||"");
-  document.getElementById("stats").textContent =
-    "Messages: "+feed.querySelectorAll(".msg").length+" shown ("+AGENTS.map((a)=>a+" "+(counts[a]||0)).join(" · ")+") · type="+typeF+" · tail="+(tailN||"all");
-  document.getElementById("tokenmeter").innerHTML =
-    "View <b>"+tokens(feed.innerText)+"</b> tokens~ vs full <b>"+fullTok+"</b> tokens~";
-  if (stick) window.scrollTo(0, document.body.scrollHeight);
-}
-let lastSeenLine = -1, lastFetchGame = null, lastFetchMode = "", polling = false;
-async function poll(){
-  if (paused || polling) return;
-  polling = true;
-  try {
-    await refreshGames();
-    if (!currentGame) return;
-    if (currentGame !== lastTreeGame){ lastTreeGame = currentGame; loadTree(); }
-    const s = await (await fetch("/stats?game="+encodeURIComponent(currentGame)+"&t="+Date.now(),{cache:"no-store"})).json();
-    lastStats = s;
-    const freshGame = currentGame !== lastFetchGame || viewMode !== lastFetchMode;
-    if (!freshGame && lastText !== null && s.last_line === lastSeenLine){
-      document.getElementById("status").innerHTML = '<span class="live">● live</span>';
-      return; // nothing new: skip the heavy fetch + full re-render
-    }
-    if (viewMode === "brief"){
-      const b = await (await fetch("/brief?game="+encodeURIComponent(currentGame)+"&t="+Date.now(),{cache:"no-store"})).json();
-      lastBrief = b; lastText = b.text;
-      document.getElementById("status").innerHTML = '<span class="live">● live</span>';
-      render(parse("Human: brief placeholder\\n"));
-    } else {
-      const r = await fetch("/messages?game="+encodeURIComponent(currentGame)+"&t="+Date.now(),{cache:"no-store"});
-      const t = await r.text();
-      document.getElementById("status").innerHTML = '<span class="live">● live</span>';
-      lastText = t; lastItems = parse(t); render(lastItems);
-    }
-    lastSeenLine = s.last_line; lastFetchGame = currentGame; lastFetchMode = viewMode;
-  } catch(e){ document.getElementById("status").textContent = "disconnected - retrying"; }
-  finally { polling = false; }
-}
-function restartPoll(){ if (pollTimer) clearInterval(pollTimer); if (refreshMs>0) pollTimer = setInterval(poll, refreshMs); }
-document.querySelectorAll(".chip[data-agent]").forEach((b)=>{
-  b.addEventListener("click", ()=>{
-    const a=b.getAttribute("data-agent");
-    if (hidden.has(a)){ hidden.delete(a); b.classList.remove("off"); }
-    else { hidden.add(a); b.classList.add("off"); }
-    if (lastItems.length) render(lastItems);
-  });
-});
-document.querySelectorAll(".chip[data-view]").forEach((b)=>{
-  b.addEventListener("click", ()=>{
-    document.querySelectorAll(".chip[data-view]").forEach((x)=>x.classList.remove("on"));
-    b.classList.add("on"); viewMode=b.getAttribute("data-view"); poll();
-  });
-});
-document.getElementById("pause").addEventListener("click",(e)=>{ paused=!paused; e.target.textContent=paused?"Resume live":"Pause live"; e.target.classList.toggle("off",paused); });
-document.getElementById("search").addEventListener("input",(e)=>{ query=e.target.value.toLowerCase(); if (lastItems.length) render(lastItems); });
-document.getElementById("tailsel").addEventListener("change",(e)=>{ tailN=parseInt(e.target.value,10)||0; if (lastItems.length) render(lastItems); });
-document.getElementById("typesel").addEventListener("change",(e)=>{ typeF=e.target.value; if (lastItems.length) render(lastItems); });
-document.getElementById("collapsebtn").addEventListener("click",(e)=>{ collapseLong=!collapseLong; e.target.classList.toggle("on",collapseLong); if (lastItems.length) render(lastItems); });
-document.getElementById("newestbtn").addEventListener("click",(e)=>{ newestFirst=!newestFirst; e.target.textContent="Newest first: "+(newestFirst?"on":"off"); e.target.classList.toggle("on",newestFirst); if (lastItems.length) render(lastItems); });
-document.getElementById("refsel").addEventListener("change",(e)=>{ refreshMs=parseInt(e.target.value,10)||0; restartPoll(); });
-document.getElementById("cancelgame").addEventListener("click", closeNewGame);
-document.getElementById("creategame").addEventListener("click", createGame);
-document.getElementById("newgametitle").addEventListener("keydown",(e)=>{ if(e.key==="Enter") createGame(); if(e.key==="Escape") closeNewGame(); });
-async function copyText(s, okMsg){
-  try { await navigator.clipboard.writeText(s); } catch(e){
-    const ta=document.createElement("textarea"); ta.value=s; document.body.appendChild(ta); ta.select(); try{document.execCommand("copy");}catch(_){} ta.remove();
-  }
-}
-document.getElementById("copyview").addEventListener("click", async ()=>{
-  await copyText(document.getElementById("feed").innerText.slice(0,60000));
-});
-document.getElementById("copydigest").addEventListener("click", async ()=>{
-  try {
-    const r = await fetch("/digest?game="+encodeURIComponent(currentGame)+"&format=text&per_msg=180&t="+Date.now());
-    await copyText(await r.text());
-  } catch(e){}
-});
-document.getElementById("dljson").addEventListener("click", async ()=>{
-  const r = await fetch("/messages?game="+encodeURIComponent(currentGame)+"&format=json&t="+Date.now());
-  const blob = new Blob([await r.text()],{type:"application/json"});
-  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = currentGame.replace(/\\.txt$/,"")+".json"; a.click();
-});
-document.getElementById("dldigest").addEventListener("click", async ()=>{
-  const r = await fetch("/digest?game="+encodeURIComponent(currentGame)+"&format=text&per_msg=180&t="+Date.now());
-  const blob = new Blob([await r.text()],{type:"text/plain"});
-  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = currentGame.replace(/\\.txt$/,"")+"-digest.txt"; a.click();
-});
-document.getElementById("jumptop").addEventListener("click", ()=>window.scrollTo(0,0));
-document.getElementById("jumplatest").addEventListener("click", ()=>window.scrollTo(0,document.body.scrollHeight));
-document.getElementById("protocolbtn").addEventListener("click", async ()=>{
-  const p = document.getElementById("protocolpanel");
-  const showing = p.style.display !== "none";
-  if (showing){ p.style.display = "none"; return; }
-  p.style.display = "block";
-  try {
-    const r = await fetch("/guide?t="+Date.now(), {cache:"no-store"});
-    document.getElementById("protocoltext").textContent = await r.text();
-  } catch(e){ document.getElementById("protocoltext").textContent = "Could not load /guide."; }
-});
-document.getElementById("closeprotocol").addEventListener("click", ()=>{ document.getElementById("protocolpanel").style.display = "none"; });
-document.getElementById("dlappbtn").addEventListener("click", ()=>{ window.location.href = "/download"; });
-let delStep = 1;
-function showDelStep(){ [1,2,3].forEach((i)=>{ document.getElementById("delstep"+i).style.display = i===delStep ? "block" : "none"; }); }
-document.getElementById("delbtn").addEventListener("click", async ()=>{
-  await refreshGames();
-  const sel = document.getElementById("delsel");
-  sel.innerHTML = "";
-  games.forEach((g)=>{
-    const o = document.createElement("option");
-    o.value = g.id;
-    o.textContent = g.label + " (" + g.messages + " msgs)";
-    if (g.id === "AI INTERCONNECTION CENTER.txt"){ o.disabled = true; o.textContent += " — protected, cannot delete"; }
-    sel.appendChild(o);
-  });
-  document.getElementById("delack").checked = false;
-  document.getElementById("delname").value = "";
-  document.getElementById("delword").value = "";
-  document.getElementById("delerr").textContent = "";
-  delStep = 1; showDelStep();
-  document.getElementById("delmodal").style.display = "flex";
-});
-document.getElementById("delclose").addEventListener("click", ()=>{ document.getElementById("delmodal").style.display = "none"; });
-document.getElementById("delnext1").addEventListener("click", ()=>{
-  if (!document.getElementById("delack").checked){ document.getElementById("delerr").textContent = "Step 1/3: tick the box first."; return; }
-  document.getElementById("delerr").textContent = "";
-  document.getElementById("delwant").textContent = "Expected: " + document.getElementById("delsel").value;
-  delStep = 2; showDelStep();
-});
-document.getElementById("delback2").addEventListener("click", ()=>{ delStep = 1; showDelStep(); });
-document.getElementById("delnext2").addEventListener("click", ()=>{
-  if (!document.getElementById("delname").value){ document.getElementById("delerr").textContent = "Step 2/3: retype the exact file name."; return; }
-  document.getElementById("delerr").textContent = "";
-  delStep = 3; showDelStep();
-});
-document.getElementById("delback3").addEventListener("click", ()=>{ delStep = 2; showDelStep(); });
-document.getElementById("delgo").addEventListener("click", async ()=>{
-  const err = document.getElementById("delerr");
-  try {
-    const r = await fetch("/delete_game", {
-      method: "POST", headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({
-        game: document.getElementById("delsel").value,
-        confirm_understand: document.getElementById("delack").checked,
-        confirm_name: document.getElementById("delname").value,
-        confirm_irreversible: document.getElementById("delword").value,
-      }),
-    });
-    const res = await r.json();
-    if (!res.ok){ err.textContent = res.error || "Delete failed."; return; }
-    document.getElementById("delmodal").style.display = "none";
-    lastText = null; lastFetchGame = null;
-    await refreshGames(); poll();
-  } catch(e){ err.textContent = "Server unreachable."; }
-});
-document.getElementById("copyprotocol").addEventListener("click", async ()=>{
-  await copyText(document.getElementById("protocoltext").textContent.slice(0,60000));
-});
-async function sendMessage(){
-  const box=document.getElementById("composer"), err=document.getElementById("composererr");
-  const text=box.value.trim();
-  if(!text) return;
-  if(text.length>2000){ err.textContent="Message too long (max 2000 chars)."; return; }
-  if(!currentGame){ err.textContent="No channel selected."; return; }
-  try {
-    const r=await fetch("/messages?game="+encodeURIComponent(currentGame),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text})});
-    const res=await r.json();
-    if(!res.ok){ err.textContent=res.error||"Send failed."; return; }
-    box.value=""; err.textContent=""; poll();
-  } catch(e){ err.textContent="Server unreachable."; }
-}
-document.getElementById("sendbtn").addEventListener("click", sendMessage);
-document.getElementById("composer").addEventListener("keydown",(e)=>{ if((e.ctrlKey||e.metaKey)&&e.key==="Enter") sendMessage(); });
-document.addEventListener("keydown",(e)=>{
-  if (e.target.tagName==="INPUT"||e.target.tagName==="TEXTAREA") return;
-  if (e.key==="/"){ e.preventDefault(); document.getElementById("search").focus(); }
-  else if (e.key==="c"){ document.getElementById("copydigest").click(); }
-  else if (e.key==="1"){ document.querySelector('.chip[data-view="full"]').click(); }
-  else if (e.key==="2"){ document.querySelector('.chip[data-view="compact"]').click(); }
-  else if (e.key==="3"){ document.querySelector('.chip[data-view="brief"]').click(); }
-});
-async function loadTree(){
-  if (!currentGame) return;
-  try {
-    const r = await fetch("/tree?game="+encodeURIComponent(currentGame)+"&t="+Date.now(), {cache:"no-store"});
-    if (!r.ok){ treeData = null; renderTree(); return; }
-    treeData = await r.json();
-    treeCollapsed = new Set();
-    autoCollapse(treeData.tree, "", 0);
-    renderTree();
-  } catch(e){ treeData = null; renderTree(); }
-}
-function autoCollapse(nodes, prefix, depth){
-  (nodes||[]).forEach((n,i)=>{
-    const id = prefix ? prefix+"."+i : ""+i;
-    if (depth >= 1 && n.children && n.children.length) treeCollapsed.add(id);
-    autoCollapse(n.children||[], id, depth+1);
-  });
-}
-function treeMatches(n, q){
-  const s = ((n.title||"")+" "+(n.detail||"")+" "+((n.refs||[]).join(" "))).toLowerCase();
-  if (s.indexOf(q) >= 0) return true;
-  return (n.children||[]).some((k)=>treeMatches(k, q));
-}
-function renderTreeNode(n, id, depth){
-  const hasKids = n.children && n.children.length;
-  const shut = treeCollapsed.has(id);
-  let h = '<div class="tnode"><div class="trow" data-id="'+id+'"><span style="color:var(--dim)">'+(hasKids ? (shut ? "&#9656;" : "&#9662;") : "&middot;")+'</span> ';
-  h += '<span class="ttitle">'+esc(n.title||"")+'</span>';
-  if (n.detail) h += ' <span class="tdetail">&mdash; '+esc(n.detail)+'</span>';
-  if (n.refs && n.refs.length) h += ' <span class="trefs">['+esc(n.refs.slice(0,6).join(", ")) +']</span>';
-  h += '</div>';
-  if (hasKids && !shut){
-    h += '<div class="tkids">';
-    n.children.forEach((k,i)=>{ h += renderTreeNode(k, id+"."+i, depth+1); });
-    h += '</div>';
-  }
-  return h + '</div>';
-}
-function renderTree(){
-  const box = document.getElementById("tree"), meta = document.getElementById("treemeta");
-  if (!treeData || !treeData.tree || !treeData.tree.length){
-    meta.textContent = "No tree yet for this channel — agents: seed it via POST /tree.";
-    box.innerHTML = ""; return;
-  }
-  meta.textContent = "v"+treeData.version+" · "+treeData.nodes+" nodes · ~"+treeData.est_tokens+" tok · by "+(treeData.updated_by||"?")+" "+(treeData.updated_at||"");
-  const q = treeFilterQ.trim().toLowerCase();
-  let nodes = treeData.tree;
-  if (q) nodes = nodes.filter((n)=>treeMatches(n, q));
-  if (!nodes.length){ box.innerHTML = '<div style="color:var(--dim);font-size:12px;">No matches.</div>'; return; }
-  let h = "";
-  nodes.forEach((n,i)=>{ h += renderTreeNode(n, ""+i, 0); });
-  box.innerHTML = h;
-  box.querySelectorAll(".trow").forEach((row)=>{
-    row.addEventListener("click", ()=>{
-      const id = row.getAttribute("data-id");
-      if (treeCollapsed.has(id)) treeCollapsed.delete(id); else treeCollapsed.add(id);
-      renderTree();
-    });
-  });
-}
-document.getElementById("treefilter").addEventListener("input", (e)=>{ treeFilterQ = e.target.value; renderTree(); });
-document.getElementById("treeexpand").addEventListener("click", ()=>{ treeCollapsed = new Set(); renderTree(); });
-document.getElementById("treecollapse").addEventListener("click", ()=>{
-  treeCollapsed = new Set();
-  const walk = (nodes, prefix)=>{ (nodes||[]).forEach((n,i)=>{ const id = prefix ? prefix+"."+i : ""+i; if (n.children && n.children.length){ treeCollapsed.add(id); walk(n.children, id); } }); };
-  if (treeData) walk(treeData.tree, "");
-  renderTree();
-});
-document.getElementById("treecopy").addEventListener("click", async ()=>{
-  try {
-    const r = await fetch("/tree?game="+encodeURIComponent(currentGame)+"&format=text&t="+Date.now());
-    await copyText(await r.text());
-  } catch(e){}
-});
-document.getElementById("banner-tree").addEventListener("click", (e)=>{
-  e.preventDefault();
-  window.open("/tree?game="+encodeURIComponent(currentGame||"")+"&format=text", "_blank");
-});
-setInterval(()=>{ if (!paused && currentGame) loadTree(); }, 30000);
-document.getElementById("deepsearchbtn").addEventListener("click", async ()=>{
-  const kw = document.getElementById("deepq").value.trim();
-  const box = document.getElementById("deepresults");
-  if (!kw){ box.innerHTML = '<div style="color:var(--dim);font-size:12px;">Type a keyword first.</div>'; return; }
-  const ag = document.getElementById("deepagent").value, ty = document.getElementById("deeptype").value;
-  const mx = parseInt(document.getElementById("deepmax").value, 10) || 10;
-  box.innerHTML = '<div style="color:var(--dim);font-size:12px;">searching...</div>';
-  try {
-    let url = "/messages?game="+encodeURIComponent(currentGame)+"&format=json&q="+encodeURIComponent(kw);
-    if (ag) url += "&agent="+encodeURIComponent(ag);
-    if (ty && ty !== "all") url += "&type="+encodeURIComponent(ty);
-    const j = await (await fetch(url, {cache:"no-store"})).json();
-    const hits = (j.messages||[]).slice(-mx);
-    if (!hits.length){ box.innerHTML = '<div style="color:var(--dim);font-size:12px;">No hits in full history.</div>'; return; }
-    box.innerHTML = '<div style="color:var(--dim);font-size:12px;">'+j.count+' hit(s) in full history (~'+j.est_tokens+' tok) — showing '+hits.length+':</div>' +
-      hits.map((m, i)=>{
-        const one = m.text.replace(/\\s+/g, " ").trim();
-        const snip = one.length > 220 ? one.slice(0, 220)+"..." : one;
-        return '<div class="deephit" data-i="'+i+'"><b>'+m.agent+'</b> <span class="typepill">'+m.type+'</span> '
-          + '<span class="line">L'+m.line+'</span><div>'+esc(snip)+'</div>'
-          + '<span class="more">Show full ('+m.text.length+' chars)</span>'
-          + '<div class="body" style="display:none; white-space:pre-wrap; margin-top:4px;">'+fmtBody(m.text.trim())+'</div></div>';
-      }).join("");
-    box.querySelectorAll(".deephit").forEach((d)=>{
-      d.querySelector(".more").addEventListener("click", ()=>{
-        const b = d.querySelector(".body"), open = b.style.display !== "none";
-        b.style.display = open ? "none" : "block";
-        d.querySelector(".more").textContent = open ? "Show full" : "Hide full";
-      });
-    });
-    box.dataset.full = JSON.stringify(hits.map((m)=>({line:m.line, agent:m.agent, type:m.type, text:m.text})));
-  } catch(e){ box.innerHTML = '<div style="color:var(--dim);font-size:12px;">Search failed.</div>'; }
-});
-document.getElementById("deepcopybtn").addEventListener("click", async ()=>{
-  const raw = document.getElementById("deepresults").dataset.full;
-  if (!raw) return;
-  const hits = JSON.parse(raw);
-  await copyText(hits.map((m)=>"L"+m.line+" ["+m.agent+"]["+m.type+"] "+m.text.replace(/\\s+/g," ").trim().slice(0,400)).join("\\n"));
-});
-document.getElementById("deepq").addEventListener("keydown", (e)=>{ if (e.key === "Enter"){ e.preventDefault(); document.getElementById("deepsearchbtn").click(); } });
-document.getElementById("briefbtn").addEventListener("click", async ()=>{
-  const box = document.getElementById("composer"), err = document.getElementById("composererr");
-  if (!box.value.trim()){ err.textContent = "Nothing to condense."; return; }
-  try {
-    const r = await fetch("/brief-it", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({text: box.value})});
-    const j = await r.json();
-    box.value = j.brief;
-    err.textContent = "Briefed: " + j.orig_tokens + " -> " + j.brief_tokens + " tok (" + j.saved_pct + "% saved). Code/numbers/negations untouched.";
-  } catch(e){ err.textContent = "Brief-it failed."; }
-});
-document.getElementById("kmapbtn").addEventListener("click", async ()=>{
-  const p = document.getElementById("kmappanel");
-  if (p.style.display !== "none"){ p.style.display = "none"; return; }
-  p.style.display = "block";
-  const meta = document.getElementById("kmapmeta"), body = document.getElementById("kmapbody");
-  meta.textContent = "loading..."; body.innerHTML = "";
-  try {
-    const j = await (await fetch("/kmap?game="+encodeURIComponent(currentGame)+"&t="+Date.now(), {cache:"no-store"})).json();
-    meta.textContent = j.nodes + " nodes · " + j.edges + " edges · " + j.messages + " msgs";
-    body.innerHTML = "<div><b>Gods</b> (most-connected): " + j.gods.map((g)=>esc(g.label)+" <span style='color:var(--dim)'>"+g.degree+"</span>").join(" · ") + "</div>"
-      + "<div style='margin-top:6px;'><b>Communities</b>:</div>"
-      + j.communities.slice(0, 8).map((c)=>"<div style='margin-left:10px;'>· " + c.members.map(esc).join(", ") + "</div>").join("");
-  } catch(e){ meta.textContent = "kmap failed."; }
-});
-document.getElementById("kmapclose").addEventListener("click", ()=>{ document.getElementById("kmappanel").style.display = "none"; });
-document.getElementById("kmapgobtn").addEventListener("click", async ()=>{
-  const q = document.getElementById("kmapq").value.trim();
-  const body = document.getElementById("kmapbody");
-  if (!q) return;
-  body.innerHTML = "<div style='color:var(--dim)'>asking...</div>";
-  try {
-    const j = await (await fetch("/kmap/query?game="+encodeURIComponent(currentGame)+"&q="+encodeURIComponent(q), {cache:"no-store"})).json();
-    let h = "";
-    (j.hits||[]).forEach((x)=>{
-      h += "<div class='deephit'><b>"+esc(x.label)+"</b> <span class='typepill'>"+x.kind+" · deg "+x.degree+"</span>"
-        + (x.refs||[]).map((r)=>"<div style='margin-left:10px;'><span class='line'>L"+r.line+" "+esc(r.agent)+"</span> "+esc(r.snippet)+"</div>").join("") + "</div>";
-    });
-    (j.messages||[]).forEach((m)=>{
-      h += "<div class='deephit'><span class='line'>L"+m.line+" "+esc(m.agent)+"</span> "+esc(m.snippet)+"</div>";
-    });
-    body.innerHTML = h || "<div style='color:var(--dim)'>No hits.</div>";
-  } catch(e){ body.innerHTML = "<div style='color:var(--dim)'>Query failed.</div>"; }
-});
-document.getElementById("kmapq").addEventListener("keydown", (e)=>{ if (e.key === "Enter"){ e.preventDefault(); document.getElementById("kmapgobtn").click(); } });
-restartPoll(); poll();
-</script>
-</body>
-</html>
-"""
 
 
-def append_human_message(game, text):
-    """Append a Human message to a channel. Returns (ok, error)."""
-    agents = AGENTS
-    if not isinstance(text, str):
-        return None, "Empty message."
-    clean = text.replace("\r", "").strip()
-    if not clean:
-        return None, "Empty message."
-    if len(clean) > 2000:
-        return None, "Message too long (max 2000 chars)."
-    guarded = []
-    for line in clean.split("\n"):
-        if AGENT_RE.match(line):
-            guarded.append("> " + line)
-        else:
-            guarded.append(line)
-    path = None
-    for g in list_games():
-        if g["id"] == game:
-            path = os.path.join(ROOT, g["id"])
-            break
-    if path is None:
-        return None, "Unknown channel."
-    with open(path, "a", encoding="utf-8") as f:
-        f.write("\nHuman: " + "\n".join(guarded) + "\n")
-    return True, ""
+def render_sync_text(s):
+    g = s["game"]
+    lines = ["SYNC %s as %s | cursor=%d (send since=%d next time)%s" % (
+        channel_label(g), s["agent"], s["cursor"], s["cursor"],
+        " | FIRST SYNC: showing last 5 as digest" if s["first_sync"] else "")]
+    if s["rules"]:
+        lines += ["", "PROJECT RULES (follow these):", s["rules"].strip()]
+    if s["team"]:
+        lines.append("TEAM: " + "; ".join("%s %s%s" % (t["agent"], _ago(t["ago_s"]), (" - " + t["doing"]) if t["doing"] else "")
+                                         for t in s["team"]))
+    if s["claims_by_others"]:
+        lines.append("CLAIMED BY OTHERS (do not edit):")
+        for c in s["claims_by_others"]:
+            lines.append("  %s %s: %s%s (until %s)" % (c["id"], c["agent"], ", ".join(c["paths"]),
+                                                    (' "%s"' % c["note"]) if c["note"] else "", c["expires_at"][11:16] + "Z"))
+    if s["your_claims"]:
+        lines.append("YOUR CLAIMS: " + "; ".join("%s %s" % (c["id"], ", ".join(c["paths"])) for c in s["your_claims"]))
+    if s["your_tasks"]:
+        lines.append("YOUR TASKS:")
+        for t in s["your_tasks"]:
+            lines.append("  %s [%s] %s%s" % (t["id"], t["status"], t["title"],
+                                           (" (" + ", ".join(t["paths"]) + ")") if t["paths"] else ""))
+    elif s["unassigned_todo"]:
+        lines.append("TASKS: none assigned to you; %d unassigned todo (GET /tasks?status=todo)" % s["unassigned_todo"])
+    if s["tree"]["changed"]:
+        lines.append("TREE CHANGED: v%d by %s -> GET /tree?game=%s&format=text" % (
+            s["tree"]["version"], s["tree"]["updated_by"] or "?", quote(g)))
+    msgs = s["messages"]
+    if not msgs:
+        lines.append("NEW: nothing since L%s%s." % (s["since"], " (only your own posts)" if s["own_count"] else ""))
+    else:
+        lines.append("")
+        lines.append("NEW (%d message%s%s):" % (len(msgs), "" if len(msgs) == 1 else "s",
+                                               "" if all(m["full"] for m in msgs) else ", digest; addressed to you in full"))
+        for m in msgs:
+            mark = ">> " if m["addressed"] else ""
+            if m["full"]:
+                lines.append("%s--- L%d %s [%s] ---\n%s" % (mark, m["line"], m["agent"], m["type"], m["text"]))
+            else:
+                lines.append("%sL%d %s [%s] %s" % (mark, m["line"], m["agent"], m["type"], m["text"]))
+    return "\n".join(lines)
+
+
+def _ago(sec):
+    if sec < 90:
+        return "%ds ago" % sec
+    if sec < 5400:
+        return "%dm ago" % (sec // 60)
+    return "%dh ago" % (sec // 3600)
+
+
+def team_status(game):
+    items, _ = load_items(game)
+    pres = store.presence(game)
+    claims = store.active_claims(game)
+    tasks = store.list_tasks(game)
+    counts, last = {}, {}
+    for it in items:
+        counts[it["agent"]] = counts.get(it["agent"], 0) + 1
+        last[it["agent"]] = (it["line"], it["ts"])
+    out = []
+    for a in store.roster() + [{"name": HUMAN, "color": "", "role": "Project owner", "provider": "",
+                                "model": "", "archived": False}]:
+        n = a["name"]
+        if a["archived"] and n not in counts:
+            continue
+        p = pres.get(n, {})
+        out.append({
+            "name": n, "color": a["color"], "role": a["role"], "archived": a["archived"],
+            "hosted": store.is_hosted(a), "provider": a["provider"], "model": a["model"],
+            "seen": p.get("seen"), "doing": p.get("doing", ""), "state": p.get("state", ""), "error": p.get("error", ""),
+            "messages": counts.get(n, 0), "last_line": last.get(n, (0, None))[0], "last_ts": last.get(n, (0, None))[1],
+            "claims": [c for c in claims if c["agent"] == n],
+            "open_tasks": sum(1 for t in tasks if t["assignee"] == n and t["status"] != "done"),
+        })
+    return {"game": game, "now": time.time(), "agents": out}
+
+
+def onboard_text(game, agent, base, fmt="rules"):
+    """Copy-paste setup for one agent: rules file, MCP config, or CLI."""
+    label = channel_label(game)
+    q = quote(game)
+    auth = store.load_config()["auth"]["enabled"]
+    key_hdr = ' -H "X-AIC-Key: $AIC_KEY"' if auth else ""
+    mcp_path = os.path.join(APP_DIR, "aic_mcp.py")
+    py = "python"
+    if fmt == "mcp":
+        env = {"AIC_URL": base, "AIC_AGENT": agent, "AIC_GAME": game}
+        if auth:
+            env["AIC_KEY"] = "<your access key>"
+        cfg = json.dumps({"mcpServers": {"aic": {"command": py, "args": [mcp_path], "env": env}}}, indent=2)
+        envflags = " ".join('-e %s="%s"' % kv for kv in env.items())
+        toml_env = ", ".join('%s = "%s"' % kv for kv in env.items())
+        return """MCP server for {agent} (tools: aic_sync, aic_post, aic_claim, aic_release, aic_tasks, aic_task_update, aic_tree, aic_read, aic_search)
+
+Claude Code:
+  claude mcp add aic {envflags} -- {py} "{path}"
+
+Codex CLI (~/.codex/config.toml):
+  [mcp_servers.aic]
+  command = "{py}"
+  args = [{path_json}]
+  env = {{ {toml_env} }}
+
+Cursor (.cursor/mcp.json) / Cline / Windsurf / any MCP client:
+{cfg}
+
+Then add to the agent's rules: "Call aic_sync at the start of every turn. Claim paths with aic_claim before
+editing. After each change call aic_post with type 'Change Notice'. Release claims when done."
+""".format(agent=agent, envflags=envflags, py=py, path=mcp_path, path_json=json.dumps(mcp_path),
+           toml_env=toml_env, cfg=cfg)
+    if fmt == "cli":
+        cli = os.path.join(APP_DIR, "channel_cli.py")
+        g = game.replace('"', '\\"')
+        return """Terminal agents (works the same on Windows, macOS, Linux; needs the hub running):
+  set AIC_AGENT={agent}        (PowerShell: $env:AIC_AGENT="{agent}"   bash: export AIC_AGENT={agent})
+  {py} "{cli}" sync --game "{g}"
+  {py} "{cli}" claim --game "{g}" src/file.lua --note "why"
+  {py} "{cli}" post --game "{g}" --type "Change Notice" --text "WHAT: ..  FILES: ..  VERIFIED: .."
+  {py} "{cli}" release --game "{g}" --all
+  {py} "{cli}" tasks --game "{g}" --mine
+  {py} "{cli}" task-set --game "{g}" T3 --status review
+The CLI stores the sync cursor for you (.aic/cursors). Raw HTTP works too:
+  curl -s{key} "{base}/sync?game={q}&agent={agent}"
+""".format(agent=agent, py=py, cli=cli, g=g, base=base, q=q, key=key_hdr)
+    project = store.load_project(game)
+    rules = ("\n### Project rules\n" + project["rules"].strip() + "\n") if project["rules"].strip() else ""
+    keyline = ("\nSend the header `X-AIC-Key: <your access key>` on every request (the human gives you the key).\n"
+               if auth else "")
+    return """## Team coordination - AI Interconnection Center
+
+You are **{agent}** on project **{label}**. Other AI agents work on this codebase at the same time;
+a shared hub keeps you in sync and the human watches it live.
+Hub: {base}    Project id: `{game}`{keyline}
+
+### Every turn
+1. **Sync first:** `GET {base}/sync?game={q}&agent={agent}&since=<cursor>`
+   Returns new messages (the ones addressed to you in full), your tasks, files other agents have
+   claimed, and a new `cursor`. Keep the cursor and send it next time (omit `since` the first time).
+2. **Claim before you edit:** `POST {base}/claim` with
+   `{{"game":"{game}","agent":"{agent}","paths":["path/to/file"],"note":"why","ttl_min":30}}`.
+   HTTP 409 means another agent holds an overlapping path: work on something else or @mention them.
+3. **Post a change notice after every change:** `POST {base}/post` with
+   `{{"game":"{game}","agent":"{agent}","type":"Change Notice","text":"WHAT: ...\\nFILES: ...\\nVERIFIED: ..."}}`.
+   Say exactly what you verified and what you did not.
+4. **Finish:** release claims (`POST {base}/release` `{{"game":"{game}","agent":"{agent}","all":true}}`) and move
+   your task (`POST {base}/tasks/update` `{{"game":"{game}","agent":"{agent}","id":"T3","status":"review"}}`).
+
+### Rules
+- Address teammates with @Name; ask the human with @Human; use type "Blocker" when you are stuck,
+  "Question" for questions, "Handoff" when passing work on.
+- When sync says the tree changed, read `GET {base}/tree?game={q}&format=text`; update the tree after
+  structural changes (`POST /tree` with `expected_version`).
+- Never edit a path another agent has claimed. Never edit or delete channel history.
+- Write for other agents: facts, paths, numbers. No greetings, no recaps.
+- Full protocol: `GET {base}/guide`.
+{rules}""".format(agent=agent, label=label, base=base, game=game, q=q, keyline=keyline, rules=rules)
+
+
+RULE_TEMPLATES = {
+    "roblox": """- Server authority: game state, damage, currency, inventory and saves live in ServerScriptService. Never trust the client.
+- Client code (StarterPlayerScripts / StarterCharacterScripts / StarterGui) does input, camera, UI and effects only.
+- Shared modules go in ReplicatedStorage; server-only modules in ServerScriptService or ServerStorage, never in ReplicatedStorage.
+- Every RemoteEvent / RemoteFunction handler validates its arguments (type, range, rate, ownership) on the server.
+- No RemoteFunction calls from server to client (a client can hang the server).
+- Rojo: edit files under src/ only, never the place file directly; keep default.project.json mappings in sync with new folders.
+- DataStore: wrap calls in pcall, retry with backoff, version the save schema; never write per-frame.
+- Report in every change notice: which side (server/client/shared) each changed script runs on.""",
+    "godot": """- One owner per scene file (.tscn); claim the scene before editing it - merge conflicts in scenes are expensive.
+- Autoloads hold global state; list any new autoload in the change notice.
+- Signals over direct node paths across scenes; no get_node("../../..") chains.
+- Exported builds must boot to the first scene: after every change, run the project headless or launch the export once.
+- Keep resources (.tres) small and referenced, not duplicated; note any new input actions in project.godot.""",
+    "web": """- API contract changes (routes, payloads, DB schema) need a Decision message before code lands.
+- Each change notice lists the commands run (tests, lint, typecheck) and their result.
+- No secrets in the repo; config through environment variables.
+- Frontend and backend owners claim their folders; shared types live in one place.""",
+}
+
+
+# ---------------------------------------------------------------- hosted agents
+
+_hosted_locks = {}
+_hosted_guard = threading.Lock()
+
+
+def hosted_prompt(game, agent, trigger=None, prompt_text="", requested_by=HUMAN):
+    label = channel_label(game)
+    project = store.load_project(game)
+    limit = min(store.load_config()["settings"]["max_message_chars"], 6000)
+    tree, _ = load_tree(game)
+    tree_txt = render_tree_text(tree["roots"], 8000) if tree and tree.get("roots") else "(no project tree yet)"
+    items, chars = load_items(game)
+    brief = build_brief(items, chars, recent=6, budget_chars=14000)["text"] if items else "(channel is empty)"
+    tasks = [t for t in store.list_tasks(game) if t["status"] != "done"]
+    task_txt = "\n".join("%s [%s] %s -> %s" % (t["id"], t["status"], t["title"], t["assignee"] or "unassigned")
+                         for t in tasks[:40]) or "(none)"
+    system = (
+        "You are %s%s, one of several AI agents working with a human on the project \"%s\". "
+        "The team coordinates through a shared chat channel (the AI Interconnection Center) and you are replying inside it. "
+        "You cannot edit files or run code from here: you answer, review, plan and decide. "
+        "When work needs to be done in the codebase, say which agent should do it and @mention them. "
+        "Write for other agents: facts first, exact names, paths and numbers, no greetings, no recap of the question. "
+        "Keep the reply under %d characters. Do not start the reply with your own name."
+        % (agent["name"], (", " + agent["role"]) if agent["role"] else "", label, limit))
+    if project["rules"].strip():
+        system += "\n\nProject rules every agent follows:\n" + project["rules"].strip()
+    if agent["system"].strip():
+        system += "\n\n" + agent["system"].strip()
+    user = ("PROJECT TREE (shared context):\n%s\n\nOPEN TASKS:\n%s\n\nCHANNEL (older messages as a one-line digest, newest in full):\n%s\n\n"
+            % (tree_txt, task_txt, brief))
+    if trigger:
+        user += "You were addressed in L%d by %s:\n%s\n\nWrite your reply." % (trigger["line"], trigger["agent"], trigger["text"])
+    else:
+        user += "Request from %s:\n%s\n\nWrite your reply." % (requested_by, prompt_text)
+    return system, user, limit
+
+
+def run_hosted(game, name, trigger=None, prompt_text="", requested_by=HUMAN):
+    """Ask a hosted agent and post its reply. Returns (post_result, error)."""
+    agent = store.get_agent(name)
+    if not store.is_hosted(agent):
+        return None, "%s is not a hosted agent (set a provider and model in Settings > Agents)." % name
+    with _hosted_guard:
+        lock = _hosted_locks.setdefault((game, agent["name"]), threading.Lock())
+    with lock:  # one reply at a time per agent and project
+        store.touch(game, agent["name"], state="thinking", error="",
+                    doing="replying to L%d" % trigger["line"] if trigger else "answering %s" % requested_by)
+        try:
+            prov = llm.resolve(agent["provider"], store.load_config()["providers"])
+            system, user, limit = hosted_prompt(game, agent, trigger, prompt_text, requested_by)
+            reply = llm.complete(prov, agent["model"], system, user)
+        except llm.LLMError as e:
+            store.touch(game, agent["name"], state="error", error=str(e)[:300], doing="")
+            return None, str(e)
+        reply = re.sub(r"^\s*\**%s\**\s*:\s*" % re.escape(agent["name"]), "", reply, flags=re.I)
+        if len(reply) > limit:
+            reply = reply[:limit - 60].rstrip() + "\n...[reply cut at %d chars]" % (limit - 60)
+        to = [trigger["agent"]] if trigger else [requested_by]
+        res, err = append_message(game, agent["name"], reply, to=to)
+        store.touch(game, agent["name"], state="error" if err else "", error=err or "", doing="")
+        return res, err
+
+
+def trigger_hosted(game, author, line, text, mentions):
+    """Hosted agents @mentioned by anyone who is not hosted reply in the background.
+
+    Replies from hosted agents never trigger other hosted agents, so two of
+    them cannot loop.
+    """
+    if store.is_hosted(store.get_agent(author)):
+        return []
+    names = []
+    for m in mentions:
+        a = store.get_agent(m) if m != "all" else None
+        if store.is_hosted(a) and a["name"] != author:
+            names.append(a["name"])
+    trigger = {"line": line, "agent": author, "text": text}
+    for n in names:
+        threading.Thread(target=run_hosted, args=(game, n, trigger), daemon=True).start()
+    return names
+
+
+def post(game, actor, text, msg_type=None, to=None):
+    res, err = append_message(game, actor, text, msg_type=msg_type, to=to)
+    if not res:
+        return None, err
+    game = os.path.basename(game_path(game))
+    store.touch(game, res["agent"])
+    res["triggered"] = trigger_hosted(game, res["agent"], res["line"], text.strip(), res["mentions"])
+    return res, ""
+
+
+def task_event(game, actor, task, changes, created=False):
+    """One short audit line in the channel for task changes that matter."""
+    if created:
+        text = "[TASK %s created] %s" % (task["id"], task["title"])
+        if task["assignee"]:
+            text += " -> @%s" % task["assignee"]
+    elif changes.get("deleted"):
+        text = "[TASK %s deleted] %s" % (task["id"], task["title"])
+    else:
+        parts = []
+        if "status" in changes:
+            parts.append(changes["status"])
+        if "assignee" in changes:
+            parts.append(("-> @" + changes["assignee"]) if changes["assignee"] else "unassigned")
+        if not parts:
+            return
+        text = "[TASK %s %s] %s" % (task["id"], " ".join(parts), task["title"])
+    append_message(game, actor, text, msg_type="Status")
+
+
+# ---------------------------------------------------------------- HTTP
+
+MAX_BODY = 2 * 1024 * 1024
+STATIC = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js",
+          "/app.css": "app.css", "/icon.svg": "icon.svg"}
+CTYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+          ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml"}
+PUBLIC = set(STATIC) | {"/health", "/guide"}
+LOOPBACK = {"127.0.0.1", "localhost", "::1", "[::1]"}
+GET_ROUTES, POST_ROUTES = {}, {}
+
+
+def route(method, path):
+    def deco(fn):
+        (GET_ROUTES if method == "GET" else POST_ROUTES)[path] = fn
+        return fn
+    return deco
+
+
+class HTTPError(Exception):
+    def __init__(self, status, msg, **extra):
+        super().__init__(msg)
+        self.status, self.msg, self.extra = status, msg, extra
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "AIC/" + APP_VERSION
+
     def log_message(self, *args):
         pass
 
-    def send_bytes(self, body, ctype):
-        self.send_response(200)
+    # ---- responses
+    def send_bytes(self, body, ctype, status=200, extra=None):
+        self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
         self.end_headers()
-        self.wfile.write(body)
-
-    def send_json(self, obj):
-        self.send_bytes(json.dumps(obj, ensure_ascii=False).encode("utf-8"),
-                        "application/json; charset=utf-8")
-
-    def do_GET(self):
-        parts = urlparse(self.path)
-        query = parse_qs(parts.query)
-        game = (query.get("game") or [None])[0]
-
-        if parts.path == "/health":
-            self.send_json({"ok": True, "port": PORT, "version": APP_VERSION, "games": len(list_games())})
-            return
-
-        if parts.path == "/download":
-            zp = os.path.join(ROOT, "dist", "AI-Interconnection-Center-%s.zip" % APP_VERSION)
-            try:
-                with open(zp, "rb") as f:
-                    body = f.read()
-            except OSError:
-                self.send_response(404)
-                self.end_headers()
-                return
-            self.send_response(200)
-            self.send_header("Content-Type", "application/zip")
-            self.send_header("Content-Disposition", 'attachment; filename="AI-Interconnection-Center.zip"')
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
+        if self.command != "HEAD":
             self.wfile.write(body)
-            return
 
-        if parts.path == "/tree":
-            t, _path = load_tree(game)
-            if t is None:
-                self.send_response(404)
-                self.end_headers()
-                return
-            nodes = sum(1 for _ in _walk_tree(t.get("roots", [])))
-            fmt = (query.get("format") or ["json"])[0]
-            if fmt == "text":
-                try:
-                    mc = max(1000, min(int((query.get("max_chars") or ["12000"])[0]), 60000))
-                except ValueError:
-                    mc = 12000
-                body = ("# TREE %s (v%d, %d nodes) - project context, read before chat history\n# full protocol: GET /guide\n\n"
-                        % (game or "", t.get("version", 0), nodes)) + render_tree_text(t.get("roots", []), max_chars=mc)
-                self.send_bytes(body.encode("utf-8"), "text/plain; charset=utf-8")
-            else:
-                raw = json.dumps(t.get("roots", []), ensure_ascii=False)
-                self.send_json({"game": game, "version": t.get("version", 0),
-                                "updated_at": t.get("updated_at", ""),
-                                "updated_by": t.get("updated_by", ""),
-                                "nodes": nodes, "est_tokens": est_tokens(len(raw)),
-                                "tree": t.get("roots", [])})
-            return
+    def send_json(self, obj, status=200):
+        self.send_bytes(json.dumps(obj, ensure_ascii=False).encode("utf-8"),
+                        "application/json; charset=utf-8", status)
 
-        if parts.path == "/kmap" or parts.path.startswith("/kmap/"):
-            sub = parts.path[len("/kmap"):].strip("/")
-            km = build_kmap(game)
-            if sub == "":
-                self.send_json({"game": game, "messages": km["messages"],
-                                "nodes": km["node_count"], "edges": km["edge_count"],
-                                "est_tokens": km["est_tokens"],
-                                "gods": km["gods"], "communities": km["communities"]})
-            elif sub == "query":
-                q = ((query.get("q") or [""])[0])
-                self.send_json({"game": game, "q": q,
-                                **kmap_query(km, q)})
-            elif sub == "path":
-                a = ((query.get("a") or [""])[0])
-                b = ((query.get("b") or [""])[0])
-                res = kmap_path(km, a, b)
-                self.send_response(200 if "error" not in res else 400)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                self.wfile.write(json.dumps(res).encode("utf-8"))
-            elif sub == "explain":
-                res = kmap_explain(km, (query.get("node") or [""])[0])
-                self.send_response(200 if "error" not in res else 400)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                self.wfile.write(json.dumps(res).encode("utf-8"))
-            else:
-                self.send_response(404)
-                self.end_headers()
-            return
+    def send_text(self, text, status=200):
+        self.send_bytes(text.encode("utf-8"), "text/plain; charset=utf-8", status)
 
-        if parts.path == "/guide":
-            fmt = (query.get("format") or ["text"])[0]
-            if fmt == "json":
-                self.send_json({"est_tokens": est_tokens(len(GUIDE_TEXT)),
-                                "chars": len(GUIDE_TEXT), "text": GUIDE_TEXT})
-            else:
-                self.send_bytes(GUIDE_TEXT.encode("utf-8"), "text/plain; charset=utf-8")
-            return
+    # ---- request helpers
+    def qp(self, name, default=None):
+        v = self.query.get(name)
+        return v[0] if v else default
 
-        if parts.path == "/games":
-            self.send_json(list_games())
-            return
-
-        if parts.path == "/stats":
-            text, _path = read_channel_text(game)
-            items = parse_channel(text)
-            self.send_json(build_stats(items, len(text)))
-            return
-
-        if parts.path == "/digest":
-            text, _path = read_channel_text(game)
-            items = parse_channel(text)
-            try:
-                per_msg = max(40, min(int((query.get("per_msg") or ["180"])[0]), 500))
-            except ValueError:
-                per_msg = 180
-            try:
-                max_msgs = int((query.get("max_msgs") or ["0"])[0]) or 0
-            except ValueError:
-                max_msgs = 0
-            agent = (query.get("agent") or [None])[0]
-            q = (query.get("q") or [None])[0]
-            msg_type = (query.get("type") or [None])[0]
-            items = filter_items(items, agent=agent, q=q, msg_type=msg_type)
-            if max_msgs > 0:
-                items = items[-max_msgs:]
-            digest = build_digest(items, per_msg=per_msg)
-            fmt = (query.get("format") or ["json"])[0]
-            if fmt == "text":
-                lines = ["# DIGEST %s (%d messages, one line each)" % (game or "", len(digest)),
-                         "# protocol: GET /guide once, then /stats -> /digest -> /brief -> /messages?tail=N",
-                         ""]
-                for d in digest:
-                    tags = (" [" + "|".join(d["tags"][:3]) + "]") if d["tags"] else ""
-                    lines.append("L%(line)d [%(agent)s][%(type)s]%(tags)s %(snippet)s" % {
-                        "line": d["line"], "agent": d["agent"],
-                        "type": d["type"], "tags": tags, "snippet": d["snippet"]})
-                self.send_bytes(("\n".join(lines)).encode("utf-8"), "text/plain; charset=utf-8")
-            else:
-                self.send_json({"game": game, "count": len(digest), "per_msg": per_msg,
-                                "est_tokens": est_tokens(sum(len(d["snippet"]) for d in digest)),
-                                "digest": digest})
-            return
-
-        if parts.path == "/brief":
-            text, _path = read_channel_text(game)
-            items = parse_channel(text)
-            try:
-                recent = max(1, min(int((query.get("recent") or ["3"])[0]), 10))
-            except ValueError:
-                recent = 3
-            try:
-                budget = max(2000, min(int((query.get("budget_chars") or ["16000"])[0]), 60000))
-            except ValueError:
-                budget = 16000
-            brief = build_brief(items, len(text), recent=recent, budget_chars=budget)
-            fmt = (query.get("format") or ["json"])[0]
-            if fmt == "text":
-                self.send_bytes(brief["text"].encode("utf-8"), "text/plain; charset=utf-8")
-            else:
-                self.send_json({"game": game, **brief})
-            return
-
-        if parts.path == "/messages":
-            text, _path = read_channel_text(game)
-            fmt = (query.get("format") or ["text"])[0]
-            tail = (query.get("tail") or [None])[0]
-            from_line = (query.get("from_line") or [None])[0]
-            max_chars = (query.get("max_chars") or [None])[0]
-            q = (query.get("q") or [None])[0]
-            agent = (query.get("agent") or [None])[0]
-            msg_type = (query.get("type") or [None])[0]
-            # No filters at all -> exact legacy behavior (full raw file).
-            if tail is None and from_line is None and max_chars is None and q is None \
-                    and agent is None and msg_type is None and fmt == "text" \
-                    and "t" in query and len(query) == 2:
-                # poll() appends &t=timestamp; strip nothing, return raw file
-                self.send_bytes(text.encode("utf-8"), "text/plain; charset=utf-8")
-                return
-            if tail is None and from_line is None and max_chars is None and q is None \
-                    and agent is None and msg_type is None:
-                self.send_bytes(text.encode("utf-8"), "text/plain; charset=utf-8")
-                return
-            items = parse_channel(text)
-            items = filter_items(items, agent=agent, q=q, msg_type=msg_type)
-            if from_line is not None:
-                try:
-                    fl = int(from_line)
-                    items = [it for it in items if it["line"] >= fl]
-                except ValueError:
-                    pass
-            if tail is not None:
-                try:
-                    n = int(tail)
-                    if n > 0:
-                        items = items[-n:]
-                except ValueError:
-                    pass
-            if fmt == "json":
-                payload = {"game": game, "count": len(items),
-                           "est_tokens": est_tokens(sum(it["chars"] for it in items)),
-                           "messages": [{"line": it["line"], "agent": it["agent"],
-                                         "type": it["type"], "tags": it["tags"],
-                                         "tokens": it["est_tokens"], "text": it["text"]} for it in items]}
-                self.send_json(payload)
-                return
-            # text rendering of the filtered window
-            parts_out = []
-            for it in items:
-                parts_out.append("%s: %s" % (it["agent"], it["text"]))
-            body = "\n\n".join(parts_out)
-            if max_chars is not None:
-                try:
-                    mc = max(500, min(int(max_chars), 200000))
-                    if len(body) > mc:
-                        # keep the tail (most recent) when truncating
-                        body = "...[truncated oldest-first, %d chars shown]...\n\n" % mc + body[-mc:]
-                except ValueError:
-                    pass
-            self.send_bytes(body.encode("utf-8"), "text/plain; charset=utf-8")
-            return
-
-        self.send_bytes(PAGE.encode("utf-8"), "text/html; charset=utf-8")
-
-    def do_POST(self):
-        parts = urlparse(self.path)
-        if parts.path == "/delete_game":
-            try:
-                length = int(self.headers.get("Content-Length", 0))
-            except ValueError:
-                length = 0
-            try:
-                payload = json.loads(self.rfile.read(max(0, length)).decode("utf-8") or "{}")
-            except ValueError:
-                payload = {}
-            data, error = delete_game(payload.get("game"),
-                                      payload.get("confirm_understand"),
-                                      payload.get("confirm_name"),
-                                      payload.get("confirm_irreversible"))
-            if data:
-                status = 200
-            elif error == "Unknown channel.":
-                status = 404
-            elif error.startswith("The default channel"):
-                status = 403
-            else:
-                status = 400
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            out = {"ok": bool(data), "error": error or ""}
-            if data:
-                out.update(data)
-            self.wfile.write(json.dumps(out).encode("utf-8"))
-            return
-        if parts.path == "/tree":
-            query = parse_qs(parts.query)
-            game = (query.get("game") or [None])[0]
-            try:
-                length = int(self.headers.get("Content-Length", 0))
-            except ValueError:
-                length = 0
-            try:
-                payload = json.loads(self.rfile.read(max(0, length)).decode("utf-8") or "{}")
-            except ValueError:
-                payload = {}
-            roots = payload.get("tree", payload.get("roots"))
-            t, error = save_tree(game, payload.get("agent", ""), roots, payload.get("expected_version"))
-            is_conflict = bool(error) and error.startswith("Version conflict")
-            self.send_response(200 if t else (409 if is_conflict else 400))
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            out = {"ok": bool(t), "error": error or ""}
-            if t:
-                out["version"] = t["version"]
-            self.wfile.write(json.dumps(out).encode("utf-8"))
-            return
-        if parts.path == "/brief-it":
-            try:
-                length = int(self.headers.get("Content-Length", 0))
-            except ValueError:
-                length = 0
-            try:
-                payload = json.loads(self.rfile.read(max(0, length)).decode("utf-8") or "{}")
-            except ValueError:
-                payload = {}
-            try:
-                mc = max(200, min(int(payload.get("max_chars", 2000)), 8000))
-            except (TypeError, ValueError):
-                mc = 2000
-            self.send_json({"ok": True,
-                            **brief_text(payload.get("text", ""), max_chars=mc)})
-            return
-        if parts.path == "/simple":
-            try:
-                length = int(self.headers.get("Content-Length", 0))
-            except ValueError:
-                length = 0
-            try:
-                payload = json.loads(self.rfile.read(max(0, length)).decode("utf-8") or "{}")
-            except ValueError:
-                payload = {}
-            code = payload.get("code", "")
-            if not isinstance(code, str) or len(code) > 60000:
-                self.send_response(400)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(json.dumps({"ok": False,
-                                             "error": "Send code as a string (max 60000 chars)."}).encode("utf-8"))
-                return
-            self.send_json({"ok": True, **simplicity_check(code)})
-            return
-        if parts.path == "/agent_append":
-            query = parse_qs(parts.query)
-            game = (query.get("game") or [None])[0]
-            try:
-                length = int(self.headers.get("Content-Length", 0))
-            except ValueError:
-                length = 0
-            try:
-                payload = json.loads(self.rfile.read(max(0, length)).decode("utf-8") or "{}")
-            except ValueError:
-                payload = {}
-            ok, error = append_agent_message(game, payload.get("agent", ""), payload.get("text", ""))
-            self.send_response(200 if ok else 400)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(json.dumps({"ok": bool(ok), "error": error or ""}).encode("utf-8"))
-            return
-        if parts.path == "/messages":
-            query = parse_qs(parts.query)
-            game = (query.get("game") or [None])[0]
-            try:
-                length = int(self.headers.get("Content-Length", 0))
-            except ValueError:
-                length = 0
-            try:
-                payload = json.loads(self.rfile.read(max(0, length)).decode("utf-8") or "{}")
-            except ValueError:
-                payload = {}
-            ok, error = append_human_message(game, payload.get("text", ""))
-            self.send_response(200 if ok else 400)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(json.dumps({"ok": bool(ok), "error": error or ""}).encode("utf-8"))
-            return
-        if parts.path != "/new_game":
-            self.send_response(404)
-            self.end_headers()
-            return
+    def qint(self, name, default, lo, hi):
         try:
-            length = int(self.headers.get("Content-Length", 0))
+            return max(lo, min(int(self.qp(name, default)), hi))
+        except (TypeError, ValueError):
+            return default
+
+    def body(self):
+        if hasattr(self, "_body"):
+            return self._body
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             length = 0
+        if length > MAX_BODY:
+            raise HTTPError(413, "Request body too large (max 2 MB).")
+        raw = self.rfile.read(length) if length > 0 else b""
         try:
-            payload = json.loads(self.rfile.read(max(0, length)).decode("utf-8") or "{}")
-        except ValueError:
-            payload = {}
-        game_id, created = create_game(payload.get("title", ""))
-        if game_id is None:
-            self.send_response(400)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(json.dumps({
-                "ok": False,
-                "error": "Title must start with a letter or digit, up to 61 chars of letters/digits/spaces/_/-/'.",
-            }).encode("utf-8"))
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(json.dumps({"ok": True, "id": game_id, "created": created}).encode("utf-8"))
+            data = json.loads(raw.decode("utf-8") or "{}")
+        except (ValueError, UnicodeDecodeError):
+            raise HTTPError(400, "Body must be JSON.")
+        if not isinstance(data, dict):
+            raise HTTPError(400, "Body must be a JSON object.")
+        self._body = data
+        return data
+
+    def game(self, required=True):
+        """Channel id from ?game= or the JSON body, validated."""
+        g = self.qp("game")
+        if g is None and self.command == "POST":
+            g = self.body().get("game")
+        path = game_path(g)
+        if path is None:
+            if required:
+                raise HTTPError(404, "Unknown channel '%s'. GET /games lists them." % g)
+            return None
+        return os.path.basename(path)
+
+    def base(self):
+        host = self.headers.get("Host") or "127.0.0.1:%d" % PORT
+        return "http://" + host
+
+    # ---- security
+    def host_ok(self):
+        if HOST not in ("127.0.0.1", "localhost", "::1"):
+            return True  # LAN mode: access keys are the protection
+        host = (self.headers.get("Host") or "").strip().lower()
+        name = host.rsplit(":", 1)[0] if not host.startswith("[") else host.split("]")[0] + "]"
+        return name in LOOPBACK or name in set(os.environ.get("AIC_ALLOWED_HOSTS", "").lower().split(","))
+
+    def origin_ok(self):
+        """Blocks other websites from POSTing to the hub (CSRF)."""
+        site = self.headers.get("Sec-Fetch-Site")
+        if site and site not in ("same-origin", "none"):
+            return False
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True  # not a browser (curl, agents, CLI)
+        if origin == "null":
+            return False
+        host = (self.headers.get("Host") or "").lower()
+        return urlparse(origin).netloc.lower() == host
+
+    def identify(self):
+        key = self.headers.get("X-AIC-Key") or ""
+        auth = self.headers.get("Authorization") or ""
+        if not key and auth.lower().startswith("bearer "):
+            key = auth[7:].strip()
+        if not key and self.parts.path == "/events":
+            key = self.qp("key", "")  # EventSource cannot set headers
+        return store.identify_key(key)
+
+    def actor(self, name, allow_human=True):
+        """Canonical name of whoever is acting, after auth rules."""
+        if self.auth_on and self.ident != "admin":
+            if name and store.resolve_agent(name) != self.ident:
+                raise HTTPError(403, "This access key belongs to %s, not %s." % (self.ident, name))
+            return self.ident
+        canon = store.resolve_agent(name or "")
+        if not canon:
+            raise HTTPError(400, "Unknown agent '%s'. Known: %s." % (name, ", ".join(store.agent_names())))
+        if canon == HUMAN and not allow_human:
+            raise HTTPError(403, "Human is reserved for the person using the dashboard.")
+        return canon
+
+    def require_admin(self):
+        if self.auth_on and self.ident != "admin":
+            raise HTTPError(403, "Needs the admin key.")
+
+    # ---- dispatch
+    def do_HEAD(self):
+        self.dispatch("GET")
+
+    def do_GET(self):
+        self.dispatch("GET")
+
+    def do_POST(self):
+        self.dispatch("POST")
+
+    def dispatch(self, method):
+        self.parts = urlparse(self.path)
+        self.query = parse_qs(self.parts.query)
+        path = self.parts.path.rstrip("/") or "/"
+        try:
+            if not self.host_ok():
+                raise HTTPError(403, "Host not allowed (DNS-rebinding guard). Set AIC_ALLOWED_HOSTS to add one.")
+            if method == "POST" and not self.origin_ok():
+                raise HTTPError(403, "Cross-site request blocked.")
+            if method == "GET" and path in STATIC:
+                return self.static(STATIC[path])
+            routes = GET_ROUTES if method == "GET" else POST_ROUTES
+            fn = routes.get(path)
+            if fn is None and path.startswith("/kmap/") and method == "GET":
+                fn = routes.get("/kmap")
+            if fn is None:
+                raise HTTPError(404, "No such endpoint: %s %s. See GET /guide." % (method, path))
+            self.auth_on = store.load_config()["auth"]["enabled"]
+            self.ident = self.identify()
+            if self.auth_on and path not in PUBLIC and not self.ident:
+                raise HTTPError(401, "Access key required (header X-AIC-Key).")
+            fn(self)
+        except HTTPError as e:
+            self.send_json(dict({"ok": False, "error": e.msg}, **e.extra), e.status)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except TimeoutError as e:
+            self.send_json({"ok": False, "error": str(e)}, 503)
+        except Exception as e:  # never leave a client hanging on a bug
+            traceback.print_exc()
+            try:
+                self.send_json({"ok": False, "error": "Server error: %s" % e}, 500)
+            except OSError:
+                pass
+
+    def static(self, name):
+        path = os.path.join(WEB_DIR, name)
+        try:
+            with open(path, "rb") as f:
+                body = f.read()
+        except OSError:
+            raise HTTPError(404, "Missing web/%s next to channel_viewer.py." % name)
+        self.send_bytes(body, CTYPES[os.path.splitext(name)[1]])
+
+
+# ---- read endpoints
+
+@route("GET", "/health")
+def h_health(h):
+    h.send_json({"ok": True, "app": "aic", "port": PORT, "version": APP_VERSION, "games": len(channel_ids())})
+
+
+@route("GET", "/guide")
+def h_guide(h):
+    text = guide_text(h.base())
+    if h.qp("format") == "json":
+        h.send_json({"est_tokens": est_tokens(len(text)), "chars": len(text), "text": text})
+    else:
+        h.send_text(text)
+
+
+@route("GET", "/games")
+def h_games(h):
+    h.send_json(list_games())
+
+
+@route("GET", "/stats")
+def h_stats(h):
+    items, chars = load_items(h.game())
+    h.send_json(build_stats(items, chars))
+
+
+@route("GET", "/digest")
+def h_digest(h):
+    game = h.game()
+    items, _ = load_items(game)
+    per_msg = h.qint("per_msg", 180, 40, 500)
+    max_msgs = h.qint("max_msgs", 0, 0, 100000)
+    items = filter_items(items, agent=h.qp("agent"), q=h.qp("q"), msg_type=h.qp("type"))
+    if max_msgs > 0:
+        items = items[-max_msgs:]
+    digest = build_digest(items, per_msg=per_msg)
+    if h.qp("format", "json") == "text":
+        lines = ["# DIGEST %s (%d messages, one line each)" % (game, len(digest)), ""]
+        for d in digest:
+            tags = (" [" + "|".join(d["tags"][:3]) + "]") if d["tags"] else ""
+            lines.append("L%d [%s][%s]%s %s" % (d["line"], d["agent"], d["type"], tags, d["snippet"]))
+        h.send_text("\n".join(lines))
+    else:
+        h.send_json({"game": game, "count": len(digest), "per_msg": per_msg,
+                     "est_tokens": est_tokens(sum(len(d["snippet"]) for d in digest)), "digest": digest})
+
+
+@route("GET", "/brief")
+def h_brief(h):
+    game = h.game()
+    items, chars = load_items(game)
+    brief = build_brief(items, chars, recent=h.qint("recent", 3, 1, 10),
+                        budget_chars=h.qint("budget_chars", 16000, 2000, 60000))
+    if h.qp("format", "json") == "text":
+        h.send_text(brief["text"])
+    else:
+        h.send_json(dict({"game": game}, **brief))
+
+
+@route("GET", "/messages")
+def h_messages(h):
+    game = h.game()
+    fmt = h.qp("format", "text")
+    keys = ("tail", "limit", "from_line", "before_line", "max_chars", "q", "agent", "type")
+    if fmt != "json" and not any(k in h.query for k in keys):
+        text, _ = read_channel_text(game)  # legacy full dump
+        return h.send_text(text)
+    items, _ = load_items(game)
+    items = filter_items(items, agent=h.qp("agent"), q=h.qp("q"), msg_type=h.qp("type"))
+    fl = h.qint("from_line", 0, 0, 10 ** 9)
+    if fl:
+        items = [it for it in items if it["line"] >= fl]
+    bl = h.qint("before_line", 0, 0, 10 ** 9)
+    if bl:
+        items = [it for it in items if it["line"] < bl]
+    total = len(items)
+    limit = h.qint("limit", 0, 0, 100000)
+    if limit:
+        items = items[:limit]  # oldest-first window (use with from_line)
+    tail = h.qint("tail", 0, 0, 100000)
+    if tail:
+        items = items[-tail:]
+    if fmt == "json":
+        return h.send_json({"game": game, "count": len(items), "total": total,
+                            "est_tokens": est_tokens(sum(it["chars"] for it in items)),
+                            "messages": [message_json(it) for it in items]})
+    body = "\n\n".join("%s: %s" % (it["agent"], it["text"]) for it in items)
+    mc = h.qint("max_chars", 0, 500, 200000) if "max_chars" in h.query else 0
+    if mc and len(body) > mc:
+        body = "...[truncated oldest-first, %d chars shown]...\n\n" % mc + body[-mc:]
+    h.send_text(body)
+
+
+@route("GET", "/tree")
+def h_tree(h):
+    game = h.game()
+    t, _ = load_tree(game)
+    nodes = sum(1 for _ in _walk_tree(t.get("roots", [])))
+    if h.qp("format", "json") == "text":
+        mc = h.qint("max_chars", 12000, 1000, 60000)
+        body = ("# TREE %s (v%d, %d nodes, by %s) - project context\n\n"
+                % (channel_label(game), t.get("version", 0), nodes, t.get("updated_by") or "-")) + \
+            (render_tree_text(t.get("roots", []), max_chars=mc) or "(empty - POST /tree to create it)")
+        return h.send_text(body)
+    raw = json.dumps(t.get("roots", []), ensure_ascii=False)
+    h.send_json({"game": game, "version": t.get("version", 0), "updated_at": t.get("updated_at", ""),
+                 "updated_by": t.get("updated_by", ""), "nodes": nodes, "est_tokens": est_tokens(len(raw)),
+                 "tree": t.get("roots", [])})
+
+
+@route("GET", "/kmap")
+def h_kmap(h):
+    game = h.game()
+    sub = h.parts.path[len("/kmap"):].strip("/")
+    km = build_kmap(game)
+    if sub == "":
+        return h.send_json({"game": game, "messages": km["messages"], "nodes": km["node_count"],
+                            "edges": km["edge_count"], "est_tokens": km["est_tokens"],
+                            "gods": km["gods"], "communities": km["communities"]})
+    if sub == "query":
+        return h.send_json(dict({"game": game, "q": h.qp("q", "")}, **kmap_query(km, h.qp("q", ""))))
+    if sub == "path":
+        res = kmap_path(km, h.qp("a", ""), h.qp("b", ""))
+    elif sub == "explain":
+        res = kmap_explain(km, h.qp("node", ""))
+    else:
+        raise HTTPError(404, "Unknown kmap view '%s'." % sub)
+    h.send_json(res, 400 if "error" in res else 200)
+
+
+@route("GET", "/download")
+def h_download(h):
+    zp = os.path.join(APP_DIR, "dist", "AI-Interconnection-Center-%s.zip" % APP_VERSION)
+    try:
+        with open(zp, "rb") as f:
+            body = f.read()
+    except OSError:
+        raise HTTPError(404, "No package built yet. Run: python build_package.py")
+    h.send_bytes(body, "application/zip", extra={
+        "Content-Disposition": 'attachment; filename="AI-Interconnection-Center-%s.zip"' % APP_VERSION})
+
+
+@route("GET", "/sync")
+def h_sync(h):
+    game = h.game()
+    agent = h.actor(h.qp("agent"), allow_human=True)
+    since = h.qp("since")
+    try:
+        since = int(since) if since not in (None, "") else None
+    except ValueError:
+        raise HTTPError(400, "since must be the integer cursor from your last sync.")
+    s = build_sync(game, agent, since, max_chars=h.qint("max_chars", 6000, 1000, 40000))
+    h.send_json(s) if h.qp("format") == "json" else h.send_text(render_sync_text(s))
+
+
+@route("GET", "/tasks")
+def h_tasks(h):
+    game = h.game()
+    tasks = store.list_tasks(game, status=h.qp("status"), assignee=h.qp("assignee"))
+    if h.qp("format") == "text":
+        lines = ["%s [%s] %s -> %s%s" % (t["id"], t["status"], t["title"], t["assignee"] or "unassigned",
+                                         (" (" + ", ".join(t["paths"]) + ")") if t["paths"] else "") for t in tasks]
+        return h.send_text("\n".join(lines) or "(no tasks)")
+    h.send_json({"game": game, "tasks": tasks, "statuses": list(store.TASK_STATUSES)})
+
+
+@route("GET", "/claims")
+def h_claims(h):
+    game = h.game()
+    h.send_json({"game": game, "claims": store.active_claims(game)})
+
+
+@route("GET", "/team")
+def h_team(h):
+    h.send_json(team_status(h.game()))
+
+
+@route("GET", "/project")
+def h_project(h):
+    game = h.game()
+    p = store.load_project(game)
+    h.send_json({"game": game, "label": channel_label(game), "rules": p["rules"], "updated_at": p["updated_at"],
+                 "templates": RULE_TEMPLATES, "default": game == DEFAULT_CHANNEL_ID})
+
+
+@route("GET", "/onboard")
+def h_onboard(h):
+    game = h.game()
+    agent = store.resolve_agent(h.qp("agent", "")) or (store.roster(False) or [{"name": "Claude"}])[0]["name"]
+    fmt = h.qp("format", "rules")
+    if fmt not in ("rules", "mcp", "cli"):
+        raise HTTPError(400, "format must be rules, mcp or cli.")
+    h.send_text(onboard_text(game, agent, h.base(), fmt))
+
+
+@route("GET", "/api/config")
+def h_config_get(h):
+    cfg = store.public_config()
+    cfg_prov = store.load_config()["providers"]
+    cfg["presets"] = [dict(p, key_source=llm.key_source(p["id"], cfg_prov)) for p in llm.PRESETS]
+    cfg["types"] = POST_TYPES
+    cfg["version"] = APP_VERSION
+    cfg["you"] = h.ident or ("admin" if not h.auth_on else None)
+    h.send_json(cfg)
+
+
+def snapshot(game):
+    path = game_path(game)
+    sig = {}
+    for k, p in (("messages", path), ("tree", path + ".tree.json" if path else None),
+                 ("tasks", store.project_file(game, "tasks.json")),
+                 ("claims", store.project_file(game, "claims.json")),
+                 ("project", store.project_file(game, "project.json")),
+                 ("config", store.CONFIG_PATH)):
+        try:
+            st = os.stat(p) if p else None
+            sig[k] = (st.st_mtime_ns, st.st_size) if st else None
+        except OSError:
+            sig[k] = None
+    sig["team"] = store.presence_version()
+    sig["games"] = tuple(channel_ids())
+    return sig
+
+
+@route("GET", "/events")
+def h_events(h):
+    """Server-sent events: tells the dashboard what changed, the client refetches."""
+    game = h.game()
+    h.send_response(200)
+    h.send_header("Content-Type", "text/event-stream")
+    h.send_header("Cache-Control", "no-store")
+    h.send_header("X-Accel-Buffering", "no")
+    h.end_headers()
+    last = snapshot(game)
+    started = time.time()
+    h.wfile.write(b"retry: 2000\nevent: hello\ndata: {}\n\n")
+    h.wfile.flush()
+    idle = 0
+    while time.time() - started < 1800:  # the browser reconnects on its own
+        time.sleep(0.75)
+        cur = snapshot(game)
+        changed = [k for k in cur if cur[k] != last.get(k)]
+        last = cur
+        if changed:
+            h.wfile.write(("event: change\ndata: %s\n\n" % json.dumps(changed)).encode())
+            idle = 0
+        else:
+            idle += 1
+            if idle >= 20:
+                h.wfile.write(b": ping\n\n")
+                idle = 0
+        h.wfile.flush()
+
+
+# ---- write endpoints
+
+def _post_common(h, allow_human):
+    game = h.game()
+    b = h.body()
+    agent = h.actor(b.get("agent"), allow_human=allow_human)
+    to = b.get("to")
+    if isinstance(to, str):
+        to = [x for x in re.split(r"[,\s]+", to) if x]
+    res, err = post(game, agent, b.get("text", ""), msg_type=b.get("type"), to=to)
+    if not res:
+        raise HTTPError(400, err)
+    h.send_json(dict({"ok": True, "error": ""}, **res))
+
+
+@route("POST", "/post")
+def h_post(h):
+    # the dashboard marks itself so only the human composer posts as Human
+    _post_common(h, allow_human=h.headers.get("X-AIC-Client") == "web")
+
+
+@route("POST", "/agent_append")
+def h_agent_append(h):
+    _post_common(h, allow_human=False)
+
+
+@route("POST", "/messages")
+def h_human_post(h):
+    b = h.body()
+    b.setdefault("agent", HUMAN)
+    if store.resolve_agent(b["agent"]) != HUMAN:
+        raise HTTPError(400, "POST /messages is the human composer; agents use POST /post.")
+    _post_common(h, allow_human=True)
+
+
+@route("POST", "/ask")
+def h_ask(h):
+    """Ask a hosted agent directly; waits for its reply (which is also posted)."""
+    game = h.game()
+    b = h.body()
+    requested_by = h.actor(b.get("from") or HUMAN, allow_human=True)
+    name = store.resolve_agent(b.get("agent", ""))
+    prompt = (b.get("prompt") or "").strip()
+    if not name or not prompt:
+        raise HTTPError(400, "Send {agent, prompt}.")
+    res, err = run_hosted(game, name, prompt_text=prompt, requested_by=requested_by)
+    if not res:
+        raise HTTPError(502, err)
+    items, _ = load_items(game)
+    reply = next((it["text"] for it in reversed(items) if it["line"] == res["line"]), "")
+    h.send_json(dict({"ok": True, "reply": reply}, **res))
+
+
+@route("POST", "/status")
+def h_status(h):
+    game = h.game()
+    b = h.body()
+    agent = h.actor(b.get("agent"))
+    store.touch(game, agent, doing=str(b.get("doing", ""))[:140])
+    h.send_json({"ok": True})
+
+
+@route("POST", "/claim")
+def h_claim(h):
+    game = h.game()
+    b = h.body()
+    agent = h.actor(b.get("agent"))
+    force = bool(b.get("force"))
+    if force and agent != HUMAN:
+        raise HTTPError(403, "Only the human can force a claim over someone else's.")
+    c, conflicts, err = store.claim(game, agent, b.get("paths") or b.get("path"), b.get("ttl_min", 30),
+                                    b.get("note", ""), b.get("task", ""), force=force)
+    if err:
+        raise HTTPError(400, err)
+    if conflicts and not c:
+        who = sorted({x["agent"] for x in conflicts})
+        raise HTTPError(409, "Claimed by %s: %s. Work on something else or @mention them." % (
+            ", ".join(who), "; ".join("%s %s" % (x["id"], ", ".join(x["paths"])) for x in conflicts)),
+            conflicts=conflicts)
+    store.touch(game, agent, doing=c["note"] or ("editing " + ", ".join(c["paths"][:2])))
+    h.send_json({"ok": True, "claim": c, "overridden": conflicts})
+
+
+@route("POST", "/release")
+def h_release(h):
+    game = h.game()
+    b = h.body()
+    agent = h.actor(b.get("agent"))
+    gone, err = store.release(game, agent, claim_id=b.get("id"), paths=b.get("paths"),
+                              release_all=bool(b.get("all")), privileged=agent == HUMAN)
+    if gone is None:
+        raise HTTPError(403, err)
+    if not gone:
+        raise HTTPError(404, err)
+    h.send_json({"ok": True, "released": gone})
+
+
+@route("POST", "/tasks")
+def h_task_create(h):
+    game = h.game()
+    b = h.body()
+    agent = h.actor(b.get("agent"))
+    t, err = store.create_task(game, agent, b)
+    if err:
+        raise HTTPError(400, err)
+    if not b.get("quiet"):
+        task_event(game, agent, t, {}, created=True)
+    store.touch(game, agent)
+    h.send_json({"ok": True, "task": t})
+
+
+@route("POST", "/tasks/update")
+def h_task_update(h):
+    game = h.game()
+    b = h.body()
+    agent = h.actor(b.get("agent"))
+    fields = {k: v for k, v in b.items() if k in ("title", "detail", "status", "assignee", "paths", "delete")}
+    t, changes, err = store.update_task(game, agent, b.get("id", ""), fields)
+    if err:
+        raise HTTPError(404 if err.startswith("Unknown task") else 400, err)
+    if not b.get("quiet"):
+        task_event(game, agent, t, changes)
+    store.touch(game, agent)
+    h.send_json({"ok": True, "task": t, "changes": changes})
+
+
+@route("POST", "/tree")
+def h_tree_post(h):
+    game = h.game()
+    b = h.body()
+    agent = h.actor(b.get("agent"))
+    t, err = save_tree(game, agent, b.get("tree", b.get("roots")), b.get("expected_version"))
+    if not t:
+        raise HTTPError(409 if err.startswith("Version conflict") else 400, err)
+    h.send_json({"ok": True, "error": "", "version": t["version"]})
+
+
+@route("POST", "/project")
+def h_project_post(h):
+    game = h.game()
+    b = h.body()
+    agent = h.actor(b.get("agent") or HUMAN)
+    if agent != HUMAN:
+        raise HTTPError(403, "Project label and rules are set by the human.")
+    p, err = store.save_project(game, label=b.get("label"), rules=b.get("rules"))
+    if err:
+        raise HTTPError(400, err)
+    h.send_json({"ok": True, "project": p})
+
+
+@route("POST", "/brief-it")
+def h_brief_it(h):
+    b = h.body()
+    try:
+        mc = max(200, min(int(b.get("max_chars", 2000)), 8000))
+    except (TypeError, ValueError):
+        mc = 2000
+    h.send_json(dict({"ok": True}, **brief_text(b.get("text", ""), max_chars=mc)))
+
+
+@route("POST", "/simple")
+def h_simple(h):
+    code = h.body().get("code", "")
+    if not isinstance(code, str) or len(code) > 60000:
+        raise HTTPError(400, "Send code as a string (max 60000 chars).")
+    h.send_json(dict({"ok": True}, **simplicity_check(code)))
+
+
+@route("POST", "/new_game")
+def h_new_game(h):
+    h.actor(h.body().get("agent") or HUMAN)
+    game_id, created = create_game(h.body().get("title", ""))
+    if game_id is None:
+        raise HTTPError(400, "Title must start with a letter or digit, up to 61 chars of letters/digits/spaces/_/-/'.")
+    h.send_json({"ok": True, "id": game_id, "created": created})
+
+
+@route("POST", "/delete_game")
+def h_delete_game(h):
+    h.require_admin()
+    b = h.body()
+    data, error = delete_game(b.get("game"), b.get("confirm_understand"), b.get("confirm_name"),
+                              b.get("confirm_irreversible"))
+    if not data:
+        raise HTTPError(404 if error == "Unknown channel." else 403 if error.startswith("The default") else 400, error)
+    h.send_json(dict({"ok": True, "error": ""}, **data))
+
+
+@route("POST", "/api/config")
+def h_config_post(h):
+    h.require_admin()
+    cfg, err, issued = store.update_config(h.body())
+    if err:
+        raise HTTPError(400, err)
+    h.send_json({"ok": True, "config": cfg, "issued": issued})
+
+
+@route("POST", "/api/keys")
+def h_keys(h):
+    h.require_admin()
+    key, err = store.issue_key(h.body().get("target", ""))
+    if err:
+        raise HTTPError(400, err)
+    h.send_json({"ok": True, "key": key})
+
+
+@route("POST", "/api/providers/test")
+def h_provider_test(h):
+    h.require_admin()
+    b = h.body()
+    pid = b.get("provider", "")
+    model = (b.get("model") or "").strip()
+    if not model:
+        raise HTTPError(400, "Pick a model to test with.")
+    try:
+        prov = llm.resolve(pid, store.load_config()["providers"])
+        t0 = time.time()
+        reply = llm.complete(prov, model, "You are a connectivity check.", "Reply with the single word OK.", timeout=60)
+    except llm.LLMError as e:
+        raise HTTPError(502, str(e))
+    h.send_json({"ok": True, "reply": reply[:200], "ms": int((time.time() - t0) * 1000)})
 
 
 class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -2249,8 +2190,32 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
 
 
-if __name__ == "__main__":
-    with ThreadedTCPServer(("", PORT), Handler) as httpd:
-        print(f"Channel viewer running at http://127.0.0.1:{PORT}")
-        print("AI protocol: GET /guide once, then poll /stats -> /digest -> /brief -> /messages?tail=N")
+def main():
+    os.makedirs(store.STATE_DIR, exist_ok=True)
+    if not os.path.exists(CHANNEL_FILE):  # fresh install: start with one channel
+        with open(CHANNEL_FILE, "w", encoding="utf-8", newline="\n") as f:
+            f.write(channel_template(DEFAULT_CHANNEL_ID, "Main"))
+    try:
+        httpd = ThreadedTCPServer((HOST, PORT), Handler)
+    except OSError as e:
+        print("Could not listen on %s:%d (%s). Is the hub already running? Try AIC_PORT=19844." % (HOST, PORT, e))
+        return 1
+    cfg = store.load_config()
+    print("AI Interconnection Center %s at %s" % (APP_VERSION, base_url()))
+    print("Agents: GET /guide once, then GET /sync?game=<id>&agent=<Name>&since=<cursor> every turn")
+    if HOST not in ("127.0.0.1", "localhost", "::1") and not cfg["auth"]["enabled"]:
+        print("WARNING: listening on %s without access keys - anyone on your network can post, claim and"
+              " read. Turn on access keys in Settings > Security." % HOST)
+    if cfg["auth"]["enabled"]:
+        print("Access keys are ON. The admin key is in %s" % store.CONFIG_PATH)
+    try:
         httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

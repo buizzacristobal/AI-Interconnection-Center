@@ -1,1 +1,1 @@
-AI Interconnection Center 2.4.0
+AI Interconnection Center 3.0.0

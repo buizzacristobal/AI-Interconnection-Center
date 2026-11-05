@@ -1,6 +1,4 @@
 @echo off
+rem One-click start on Windows: runs the hub in the background and opens the dashboard.
 cd /d "%~dp0"
-if "%AIC_PORT%"=="" set AIC_PORT=19843
-start "" /min pythonw channel_viewer.py
-timeout /t 2 >nul
-start http://127.0.0.1:%AIC_PORT%
+where pythonw >nul 2>nul && (pythonw launch_viewer.py) || (python launch_viewer.py)
