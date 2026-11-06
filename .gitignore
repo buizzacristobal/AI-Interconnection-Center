@@ -28,3 +28,10 @@ desktop.ini
 
 # Runtime trash folder
 .trash/
+
+# AI Interconnection Center runtime state (secrets + locks stay local;
+# .aic/projects/ holds tasks, rules and message metadata and can be committed)
+.aic/config.json
+.aic/locks/
+.aic/cursors/
+*.tmp

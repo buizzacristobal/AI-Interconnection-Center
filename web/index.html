@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Interconnection Center</title>
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="brand">
+      <img src="/icon.svg" alt="" width="22" height="22">
+      <div><b>Interconnection</b><span id="version"></span></div>
+    </div>
+    <div class="side-label">Projects <button class="icon-btn" id="newProjectBtn" title="New project">+</button></div>
+    <nav id="projects"></nav>
+    <form id="newProjectForm" class="hidden">
+      <input id="newProjectTitle" placeholder="Project name" maxlength="61" autocomplete="off">
+      <div class="row"><button class="btn primary sm" type="submit">Create</button><button class="btn sm" type="button" id="newProjectCancel">Cancel</button></div>
+      <div class="err" id="newProjectErr"></div>
+    </form>
+    <div class="side-foot">
+      <button class="side-link" id="settingsBtn"><span class="ico">&#9881;</span> Settings</button>
+      <button class="side-link" id="themeBtn"><span class="ico">&#9680;</span> <span id="themeLabel">Theme: auto</span></button>
+      <a class="side-link" href="/guide" target="_blank"><span class="ico">&#9776;</span> Agent protocol</a>
+    </div>
+  </aside>
+
+  <main id="main">
+    <header id="topbar">
+      <button class="icon-btn mobile-only" id="menuBtn" title="Projects">&#9776;</button>
+      <div class="title-block">
+        <h1 id="projectTitle">Loading&hellip;</h1>
+        <div class="sub"><span id="liveDot" class="dot"></span><span id="liveText">connecting</span><span id="projectMeta"></span></div>
+      </div>
+      <nav id="tabs">
+        <button data-view="chat" class="active">Chat</button>
+        <button data-view="tasks">Tasks <span class="count" id="taskCount"></span></button>
+        <button data-view="tree">Tree</button>
+        <button data-view="map">Map</button>
+        <button data-view="connect">Connect agents</button>
+      </nav>
+      <button class="icon-btn" id="railBtn" title="Team panel">&#9783;</button>
+    </header>
+
+    <div id="views">
+      <!-- CHAT -->
+      <section id="view-chat" class="view active">
+        <div class="chat-wrap">
+          <div class="toolbar">
+            <input id="search" type="search" placeholder="Search this project  ( / )" autocomplete="off">
+            <select id="agentFilter"><option value="">All agents</option></select>
+            <select id="typeFilter"><option value="">All types</option></select>
+            <button class="btn sm ghost" id="briefBtn" title="Copy a token-cheap brief to paste into any AI">Copy AI brief</button>
+          </div>
+          <div id="feed" tabindex="-1">
+            <div id="olderWrap" class="hidden"><button class="btn sm" id="olderBtn">Load older messages</button></div>
+            <div id="messages"></div>
+            <div id="thinking"></div>
+            <div id="empty" class="empty hidden">No messages match.</div>
+          </div>
+          <button id="jumpBtn" class="hidden">New messages &darr;</button>
+          <form id="composer">
+            <div id="mentionMenu" class="hidden"></div>
+            <textarea id="composerText" rows="1" placeholder="Message the team as Human. @Name to address an agent." autocomplete="off"></textarea>
+            <div class="composer-bar">
+              <select id="composerType" title="Message type"></select>
+              <span class="hint" id="composerHint">Ctrl+Enter to send</span>
+              <span class="err" id="composerErr"></span>
+              <button class="btn primary" type="submit" id="sendBtn">Send</button>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <!-- TASKS -->
+      <section id="view-tasks" class="view">
+        <div class="board-head">
+          <div><h2>Task board</h2><p class="muted">Agents see their tasks in every <code>/sync</code>. Drag cards between columns.</p></div>
+          <button class="btn primary" id="newTaskBtn">New task</button>
+        </div>
+        <div id="board"></div>
+      </section>
+
+      <!-- TREE -->
+      <section id="view-tree" class="view">
+        <div class="board-head">
+          <div><h2>Project tree</h2><p class="muted" id="treeMeta">Shared context every agent reads before the chat.</p></div>
+          <div class="row">
+            <input id="treeFilter" type="search" placeholder="Filter" autocomplete="off">
+            <button class="btn sm" id="treeExpand">Expand all</button>
+            <button class="btn sm" id="treeCopy">Copy as text</button>
+            <button class="btn sm" id="treeEditBtn">Edit JSON</button>
+          </div>
+        </div>
+        <div id="tree" class="card"></div>
+        <div id="treeEditor" class="card hidden">
+          <textarea id="treeJson" spellcheck="false"></textarea>
+          <div class="row"><button class="btn primary sm" id="treeSave">Save tree</button><button class="btn sm" id="treeCancel">Cancel</button><span class="err" id="treeErr"></span></div>
+        </div>
+      </section>
+
+      <!-- MAP -->
+      <section id="view-map" class="view">
+        <div class="board-head">
+          <div><h2>Knowledge map</h2><p class="muted" id="mapMeta">Concepts that keep coming up in this project's history, and how they connect.</p></div>
+        </div>
+        <div class="map-grid">
+          <div class="card">
+            <h3>Ask the history</h3>
+            <form class="row" id="mapAsk"><input id="mapQ" placeholder="e.g. what touches the save system?" autocomplete="off"><button class="btn primary sm">Ask</button></form>
+            <form class="row" id="mapPath"><input id="mapA" placeholder="From concept"><input id="mapB" placeholder="To concept"><button class="btn sm">Trace path</button></form>
+            <div id="mapResult"></div>
+          </div>
+          <div class="card"><h3>Most connected</h3><div id="mapGods" class="chips"></div><h3>Clusters</h3><div id="mapComms"></div></div>
+        </div>
+      </section>
+
+      <!-- CONNECT -->
+      <section id="view-connect" class="view">
+        <div class="board-head">
+          <div><h2>Connect an agent</h2><p class="muted">Paste this into the agent's rules file (AGENTS.md, CLAUDE.md, .cursorrules, .clinerules&hellip;) or install the MCP server. Then the agent coordinates by itself.</p></div>
+        </div>
+        <div class="connect-grid">
+          <div class="card">
+            <label class="field"><span>Agent</span><select id="connectAgent"></select></label>
+            <div class="seg" id="connectFmt">
+              <button data-fmt="rules" class="active">Rules file</button>
+              <button data-fmt="mcp">MCP server</button>
+              <button data-fmt="cli">Terminal / CLI</button>
+            </div>
+            <p class="muted small" id="connectHelp"></p>
+            <button class="btn sm" id="connectAddAgent">+ Add an agent that isn't listed</button>
+          </div>
+          <div class="card snippet"><button class="btn sm copy" id="connectCopy">Copy</button><pre id="connectText"></pre></div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <aside id="rail">
+    <div class="rail-sec"><h3>Team</h3><div id="team"></div></div>
+    <div class="rail-sec"><h3>Claimed files <span class="muted small" id="claimCount"></span></h3><div id="claims"></div></div>
+  </aside>
+</div>
+
+<!-- dialogs -->
+<dialog id="taskDialog">
+  <form method="dialog" id="taskForm">
+    <h2 id="taskDialogTitle">New task</h2>
+    <label class="field"><span>Title</span><input id="taskTitle" maxlength="160" required></label>
+    <label class="field"><span>Details</span><textarea id="taskDetail" rows="4"></textarea></label>
+    <div class="row">
+      <label class="field grow"><span>Assignee</span><select id="taskAssignee"></select></label>
+      <label class="field grow"><span>Status</span><select id="taskStatus"><option value="todo">To do</option><option value="doing">Doing</option><option value="review">Review</option><option value="done">Done</option></select></label>
+    </div>
+    <label class="field"><span>Files / paths (one per line, optional)</span><textarea id="taskPaths" rows="2" placeholder="src/save.gd"></textarea></label>
+    <div class="err" id="taskErr"></div>
+    <div class="dialog-actions">
+      <button class="btn danger ghost" type="button" id="taskDelete">Delete</button>
+      <span class="grow"></span>
+      <button class="btn" value="cancel" formnovalidate>Cancel</button>
+      <button class="btn primary" id="taskSave" value="save">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="settingsDialog" class="wide">
+  <div class="settings">
+    <nav class="settings-nav">
+      <h2>Settings</h2>
+      <button data-tab="agents" class="active">Agents</button>
+      <button data-tab="providers">AI providers &amp; keys</button>
+      <button data-tab="project">This project</button>
+      <button data-tab="security">Access &amp; security</button>
+      <span class="grow"></span>
+      <button class="btn" id="settingsClose">Close</button>
+    </nav>
+    <div class="settings-body">
+      <section data-pane="agents" class="pane active">
+        <h3>Agents</h3>
+        <p class="muted">Everyone who can post. <b>External</b> agents (Cursor, Codex, Claude Code&hellip;) connect over the API or MCP. <b>Hosted</b> agents run here through an AI provider: @mention one and it answers in the chat.</p>
+        <div id="agentList"></div>
+        <div class="row"><button class="btn sm" id="addAgentBtn">+ Add agent</button><span class="grow"></span><span class="err" id="agentsErr"></span><button class="btn primary" id="saveAgents">Save agents</button></div>
+      </section>
+      <section data-pane="providers" class="pane">
+        <h3>AI providers</h3>
+        <p class="muted">Keys are stored only on this computer in <code>.aic/config.json</code> (git-ignored) and are only sent to that provider. A key in the provider's environment variable works too.</p>
+        <div id="providerList"></div>
+      </section>
+      <section data-pane="project" class="pane">
+        <h3>This project</h3>
+        <label class="field"><span>Display name</span><input id="projLabel" maxlength="60"></label>
+        <label class="field"><span>Project rules <span class="muted">(every agent receives these in its first sync, onboarding text and hosted prompts)</span></span><textarea id="projRules" rows="10" placeholder="Architecture rules agents must respect..."></textarea></label>
+        <div class="row small"><span class="muted">Start from a template:</span><button class="btn sm ghost" data-tpl="roblox">Roblox / Luau / Rojo</button><button class="btn sm ghost" data-tpl="godot">Godot</button><button class="btn sm ghost" data-tpl="web">Web app</button></div>
+        <div class="row"><span class="err" id="projErr"></span><span class="grow"></span><button class="btn primary" id="saveProject">Save project</button></div>
+        <div class="danger-zone" id="dangerZone">
+          <h3>Delete project</h3>
+          <p class="muted">Moves the channel, its tree, tasks and claims to <code>.trash/</code> on disk. Type the project's file name to confirm:</p>
+          <code id="delName"></code>
+          <div class="row"><input id="delConfirm" autocomplete="off" placeholder="type the file name"><button class="btn danger" id="delBtn" disabled>Delete project</button></div>
+          <div class="err" id="delErr"></div>
+        </div>
+      </section>
+      <section data-pane="security" class="pane">
+        <h3>Access keys</h3>
+        <p class="muted">Off: anything on this computer can use the hub (other websites are always blocked). On: every request needs a key, and each agent's key only lets it act as itself. Turn this on before using <code>AIC_HOST=0.0.0.0</code> on a network.</p>
+        <label class="switch"><input type="checkbox" id="authToggle"><span>Require access keys</span></label>
+        <div id="authInfo" class="muted small"></div>
+        <div id="issuedKey" class="key-box hidden"></div>
+        <h3>Messages</h3>
+        <label class="field narrow"><span>Max characters per message</span><input type="number" id="maxChars" min="500" max="20000" step="500"></label>
+        <div class="row"><span class="grow"></span><button class="btn primary" id="saveSecurity">Save</button></div>
+      </section>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="keyDialog">
+  <form method="dialog" id="keyForm">
+    <h2>Access key needed</h2>
+    <p class="muted">This hub requires a key. The admin key is in <code>.aic/config.json</code> on the computer running the hub.</p>
+    <input id="keyInput" type="password" placeholder="aic_admin_..." autocomplete="off">
+    <div class="dialog-actions"><span class="grow"></span><button class="btn primary">Use key</button></div>
+  </form>
+</dialog>
+
+<div id="toast"></div>
+<script src="/app.js"></script>
+</body>
+</html>

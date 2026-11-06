@@ -1,67 +1,46 @@
 """Build the downloadable AI Interconnection Center zip.
 
 Run:  python build_package.py
-Out:  dist/AI-Interconnection-Center-<version>.zip  (+ staged folder dist/app/)
+Out:  dist/AI-Interconnection-Center-<version>.zip   (served by the hub at GET /download)
 
-The viewer serves the zip itself at GET /download.
+The package holds the app only: no channel logs, tasks or keys. A fresh
+install creates an empty "Main" channel on first start.
 """
 
 import os
-import shutil
+import py_compile
 import sys
 import zipfile
 
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
-import channel_viewer as cv
-
 ROOT = os.path.abspath(os.path.dirname(__file__))
+sys.path.insert(0, ROOT)
+import channel_viewer as cv  # noqa: E402
+
 FILES = [
-    "channel_viewer.py",
-    "channel_cli.py",
-    "launch_viewer.py",
-    "append_hub_entry.py",
-    "dist/README.txt",
-    "dist/start.bat",
-    "AI INTERCONNECTION CENTER.txt",
-    "AI INTERCONNECTION CENTER.txt.tree.json",
-    "AI INTERCONNECTION CENTER - Horror Game.txt",
-    "AI INTERCONNECTION CENTER - Horror Game.txt.tree.json",
+    "channel_viewer.py", "aic_store.py", "aic_llm.py", "aic_mcp.py", "channel_cli.py",
+    "append_hub_entry.py", "claim_guard.py", "launch_viewer.py", "start.bat", "README.md",
+    "web/index.html", "web/app.js", "web/app.css", "web/icon.svg",
 ]
 
 
 def main():
     ver = cv.APP_VERSION
-    stage = os.path.join(ROOT, "dist", "app")
-    if os.path.isdir(stage):
-        shutil.rmtree(stage)
-    os.makedirs(stage)
-    missing = []
-    for rel in FILES:
-        src = os.path.join(ROOT, rel)
-        if not os.path.exists(src):
-            missing.append(rel)
-            continue
-        shutil.copy2(src, os.path.join(stage, os.path.basename(rel)))
-    with open(os.path.join(stage, "version.txt"), "w", encoding="utf-8") as f:
-        f.write("AI Interconnection Center %s\n" % ver)
-    zipname = "AI-Interconnection-Center-%s.zip" % ver
-    zpath = os.path.join(ROOT, "dist", zipname)
-    if os.path.exists(zpath):
-        os.remove(zpath)
-    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
-        for name in sorted(os.listdir(stage)):
-            z.write(os.path.join(stage, name), "ai-interconnection-center/" + name)
-    size = os.path.getsize(zpath)
-    print("version : %s" % ver)
-    print("zip     : %s (%d bytes)" % (zpath, size))
-    print("staged  : %s" % sorted(os.listdir(stage)))
+    missing = [f for f in FILES if not os.path.exists(os.path.join(ROOT, f))]
     if missing:
-        print("MISSING : %s" % missing)
+        print("MISSING: %s" % missing)
         return 1
-    # sanity: the staged viewer must compile
-    import py_compile
-    py_compile.compile(os.path.join(stage, "channel_viewer.py"), doraise=True)
-    print("staged viewer compiles OK")
+    for f in FILES:
+        if f.endswith(".py"):
+            py_compile.compile(os.path.join(ROOT, f), doraise=True)
+    os.makedirs(os.path.join(ROOT, "dist"), exist_ok=True)
+    zpath = os.path.join(ROOT, "dist", "AI-Interconnection-Center-%s.zip" % ver)
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+        for f in FILES:
+            z.write(os.path.join(ROOT, f), "ai-interconnection-center/" + f)
+        z.writestr("ai-interconnection-center/version.txt", "AI Interconnection Center %s\n" % ver)
+    print("version : %s" % ver)
+    print("zip     : %s (%d bytes, %d files)" % (zpath, os.path.getsize(zpath), len(FILES) + 1))
+    print("all Python files compile OK")
     return 0
 
 

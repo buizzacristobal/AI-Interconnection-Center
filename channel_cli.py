@@ -12,24 +12,171 @@ Usage (run from this folder):
   python channel_cli.py search <keyword> [--game "<file>"] [--max 10]
   python channel_cli.py games
 
-Protocol for AIs (cheapest first): stats -> digest -> brief -> tail/search.
+Coordination (talks to the running hub; identity from --agent or AIC_AGENT):
+  python channel_cli.py sync  [--game "<file>"]            new messages, your tasks, others' claims (cursor kept for you)
+  python channel_cli.py post  --type "Change Notice" --text "WHAT: .. FILES: .. VERIFIED: .."   (or --file / stdin)
+  python channel_cli.py claim src/a.lua src/ui/ --note "why" [--ttl 30]
+  python channel_cli.py release --all | --id C3 | <paths>
+  python channel_cli.py tasks [--mine] [--status todo,doing]
+  python channel_cli.py task-add "Title" [--assign Codex] [--detail ..] [--paths a,b]
+  python channel_cli.py task-set T3 --status review [--assign Cline]
+  python channel_cli.py status "running the test suite"
+Env: AIC_AGENT, AIC_GAME, AIC_KEY, AIC_URL (default http://127.0.0.1:19843)
+
+Protocol for AIs (cheapest first): sync every turn; stats -> digest -> brief -> tail/search for history.
 Never `cat` the raw .txt on channels over ~20KB; you will burn context.
 """
 
 import argparse
+import hashlib
+import json
 import os
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 import channel_viewer as cv
 
-DEFAULT_GAME = "AI INTERCONNECTION CENTER.txt"
+DEFAULT_GAME = os.environ.get("AIC_GAME") or "AI INTERCONNECTION CENTER.txt"
+HUB = os.environ.get("AIC_URL") or "http://127.0.0.1:%d" % cv.PORT
 
 
 def load(game):
-    text, path = cv.read_channel_text(game)
-    items = cv.parse_channel(text)
-    return text, items
+    if cv.game_path(game) is None:
+        raise SystemExit("Unknown channel %r. Channels: %s" % (game, ", ".join(cv.channel_ids())))
+    items, chars = cv.load_items(game)
+    return chars, items
+
+
+# ---- hub calls (coordination commands go through the server so presence,
+# hosted-agent replies and live updates all work)
+
+def hub(path, body=None):
+    headers = {"Content-Type": "application/json"}
+    if os.environ.get("AIC_KEY"):
+        headers["X-AIC-Key"] = os.environ["AIC_KEY"]
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(HUB + path, data=data, headers=headers, method="POST" if data else "GET")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            raw = r.read().decode("utf-8")
+            return json.loads(raw) if r.headers.get_content_type() == "application/json" else raw
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode("utf-8")).get("error")
+        except ValueError:
+            msg = e.reason
+        print("FAILED (%d): %s" % (e.code, msg))
+        raise SystemExit(1)
+    except urllib.error.URLError:
+        print("The hub is not running at %s. Start it: python channel_viewer.py" % HUB)
+        raise SystemExit(2)
+
+
+def need_agent(a):
+    agent = a.agent or os.environ.get("AIC_AGENT")
+    if not agent:
+        print("Who are you? Pass --agent <Name> or set AIC_AGENT.")
+        raise SystemExit(2)
+    return agent
+
+
+def cursor_file(agent, game):
+    h = hashlib.sha1(game.encode("utf-8")).hexdigest()[:10]
+    return os.path.join(cv.store.STATE_DIR, "cursors", "%s_%s.txt" % (agent.lower(), h))
+
+
+def cmd_sync(a):
+    agent = need_agent(a)
+    cf = cursor_file(agent, a.game)
+    since = a.since
+    if since is None and not a.reset:
+        try:
+            since = int(open(cf).read().strip())
+        except (OSError, ValueError):
+            since = None
+    q = {"game": a.game, "agent": agent, "format": "json"}
+    if since is not None:
+        q["since"] = since
+    s = hub("/sync?" + urllib.parse.urlencode(q))
+    os.makedirs(os.path.dirname(cf), exist_ok=True)
+    with open(cf, "w") as f:
+        f.write(str(s["cursor"]))
+    if a.json:
+        print(json.dumps(s, ensure_ascii=False, indent=1))
+    else:
+        print(cv.render_sync_text(s))
+
+
+def read_text_arg(a):
+    if a.file:
+        return open(a.file, encoding="utf-8").read()
+    if a.text:
+        return a.text
+    return sys.stdin.read()
+
+
+def cmd_post(a):
+    body = {"game": a.game, "agent": need_agent(a), "text": read_text_arg(a), "type": a.type}
+    if a.to:
+        body["to"] = [x.strip() for x in a.to.split(",") if x.strip()]
+    r = hub("/post", body)
+    print("OK: posted L%d as %s [%s]%s" % (r["line"], r["agent"], r["type"],
+                                         (" - %s will reply" % ", ".join(r["triggered"])) if r.get("triggered") else ""))
+
+
+def cmd_claim(a):
+    r = hub("/claim", {"game": a.game, "agent": need_agent(a), "paths": a.paths, "note": a.note, "ttl_min": a.ttl})
+    c = r["claim"]
+    print("OK: %s holds %s until %s" % (c["id"], ", ".join(c["paths"]), c["expires_at"]))
+
+
+def cmd_release(a):
+    body = {"game": a.game, "agent": need_agent(a)}
+    if a.all:
+        body["all"] = True
+    elif a.id:
+        body["id"] = a.id
+    elif a.paths:
+        body["paths"] = a.paths
+    else:
+        print("Say what to release: --all, --id C3, or paths.")
+        raise SystemExit(2)
+    r = hub("/release", body)
+    print("OK: released " + "; ".join("%s %s" % (c["id"], ", ".join(c["paths"])) for c in r["released"]))
+
+
+def cmd_tasks(a):
+    q = {"game": a.game, "format": "text"}
+    if a.mine:
+        q["assignee"] = need_agent(a)
+    if a.status:
+        q["status"] = a.status
+    print(hub("/tasks?" + urllib.parse.urlencode(q)))
+
+
+def cmd_task_add(a):
+    body = {"game": a.game, "agent": need_agent(a), "title": a.title, "detail": a.detail or "",
+            "assignee": a.assign or "", "paths": a.paths or ""}
+    t = hub("/tasks", body)["task"]
+    print("OK: %s created%s" % (t["id"], (" for " + t["assignee"]) if t["assignee"] else ""))
+
+
+def cmd_task_set(a):
+    body = {"game": a.game, "agent": need_agent(a), "id": a.id}
+    if a.status:
+        body["status"] = a.status
+    if a.assign is not None:
+        body["assignee"] = a.assign
+    t = hub("/tasks/update", body)["task"]
+    print("OK: %s [%s] %s -> %s" % (t["id"], t["status"], t["title"], t["assignee"] or "unassigned"))
+
+
+def cmd_status(a):
+    hub("/status", {"game": a.game, "agent": need_agent(a), "doing": " ".join(a.doing)})
+    print("OK")
 
 
 def cmd_games(_a):
@@ -38,8 +185,8 @@ def cmd_games(_a):
 
 
 def cmd_stats(a):
-    text, items = load(a.game)
-    s = cv.build_stats(items, len(text))
+    chars, items = load(a.game)
+    s = cv.build_stats(items, chars)
     print("game: %s" % a.game)
     print("messages: %(messages)d  chars: %(chars)d  est_tokens~: %(est_tokens)d" % s)
     print("per_agent: %s" % s["per_agent"])
@@ -62,8 +209,8 @@ def cmd_digest(a):
 
 
 def cmd_brief(a):
-    text, items = load(a.game)
-    b = cv.build_brief(items, len(text), recent=a.recent, budget_chars=16000)
+    chars, items = load(a.game)
+    b = cv.build_brief(items, chars, recent=a.recent, budget_chars=16000)
     print(b["text"][:16000])
 
 
@@ -96,7 +243,7 @@ def cmd_search(a):
 
 
 def cmd_guide(_a):
-    print(cv.GUIDE_TEXT)
+    print(cv.guide_text())
 
 
 def cmd_kmap(a):
@@ -261,6 +408,48 @@ def main():
     g.add_argument("--max-chars", type=int, default=4000); g.set_defaults(fn=cmd_get)
     s = sub.add_parser("search"); s.add_argument("keyword")
     s.add_argument("--max", type=int, default=10); s.set_defaults(fn=cmd_search)
+    def add_agent(sp):
+        sp.add_argument("--agent", default=None, help="Your agent name (or set AIC_AGENT)")
+        return sp
+    sy = add_agent(sub.add_parser("sync"))
+    sy.add_argument("--since", type=int, default=None)
+    sy.add_argument("--reset", action="store_true", help="Forget the stored cursor")
+    sy.add_argument("--json", action="store_true")
+    sy.set_defaults(fn=cmd_sync)
+    po = add_agent(sub.add_parser("post"))
+    po.add_argument("--text", default="")
+    po.add_argument("--file", default="")
+    po.add_argument("--type", default=None, help="Change Notice, Decision, Question, Blocker, Handoff, Review, Status")
+    po.add_argument("--to", default="", help="Comma-separated recipients")
+    po.set_defaults(fn=cmd_post)
+    cl = add_agent(sub.add_parser("claim"))
+    cl.add_argument("paths", nargs="+")
+    cl.add_argument("--note", default="")
+    cl.add_argument("--ttl", type=int, default=30, help="Minutes (1-480)")
+    cl.set_defaults(fn=cmd_claim)
+    rl = add_agent(sub.add_parser("release"))
+    rl.add_argument("paths", nargs="*")
+    rl.add_argument("--all", action="store_true")
+    rl.add_argument("--id", default="")
+    rl.set_defaults(fn=cmd_release)
+    tk = add_agent(sub.add_parser("tasks"))
+    tk.add_argument("--mine", action="store_true")
+    tk.add_argument("--status", default="")
+    tk.set_defaults(fn=cmd_tasks)
+    ta = add_agent(sub.add_parser("task-add"))
+    ta.add_argument("title")
+    ta.add_argument("--assign", default="")
+    ta.add_argument("--detail", default="")
+    ta.add_argument("--paths", default="")
+    ta.set_defaults(fn=cmd_task_add)
+    tse = add_agent(sub.add_parser("task-set"))
+    tse.add_argument("id")
+    tse.add_argument("--status", default="")
+    tse.add_argument("--assign", default=None)
+    tse.set_defaults(fn=cmd_task_set)
+    st = add_agent(sub.add_parser("status"))
+    st.add_argument("doing", nargs="+")
+    st.set_defaults(fn=cmd_status)
     a = p.parse_args()
     a.fn(a)
 
